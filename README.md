@@ -27,11 +27,44 @@ Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 | **Risk-free rate on the Y-axis** (x = 0) | `src/visualization.py` |
 | **Current-portfolio marker** | `src/portfolio.py` + `visualization.py` |
 | **Comparison & reallocation tables** | `app.py` + `portfolio.reallocation_plan` |
+| **Live risk-free rate** — auto-fetch ^IRX (3M T-Bill) | `data_loader.fetch_risk_free_rate` |
+| **IBKR position import** (Flex Query / activity CSV) | `portfolio.parse_ibkr_positions` |
+| **Max-allocation-per-asset cap** | `optimizer` (`max_weight`) |
+| **Whole-share rounding + residual cash + fees** | `portfolio.reallocation_plan` |
+| **Market-benchmark reference point** | `optimizer.benchmark_point` + `visualization` |
+| **Black-Litterman market-implied returns** | `optimizer.black_litterman_implied_returns` |
 
 The chart shows the feasible-set cloud coloured by Sharpe ratio, the efficient
 frontier, the CML, the risk-free point, and star/diamond markers for the MVP,
-the tangency portfolio and your current portfolio. Hover any point to see its
-return, volatility, Sharpe ratio and weights.
+the tangency portfolio, the **market benchmark** and your current portfolio.
+Hover any point to see its return, volatility, Sharpe ratio and weights.
+
+### Advanced controls (sidebar)
+
+- **Fetch Live Risk-Free Rate (^IRX)** — toggled on by default; pulls the US
+  3-Month Treasury Bill yield from Yahoo Finance and divides by 100. Toggle off
+  (or on fetch failure) to enter Rf manually.
+- **Market Benchmark Ticker** — defaults to `SPY`; plotted as a gold marker and
+  used as the market proxy for Black-Litterman priors.
+- **Expected-returns model** — *Historical mean* or *Black-Litterman
+  (market-implied)*. BL derives the implied risk-aversion from the benchmark and
+  returns the equilibrium prior `Π = δ·Σ·w_mkt + R_f` (equal-weight market
+  portfolio); it falls back to historical returns if no benchmark is available.
+- **Max Allocation per Asset (%)** — caps each weight so the tangency portfolio
+  cannot over-concentrate in one high performer (clamped to ≥ 1/N to stay
+  feasible).
+- **Disable Fractional Shares** — rounds trades down to whole shares and reports
+  the undeployed remainder as **Residual Cash**.
+- **Estimated Transaction Cost per Trade ($)** — totalled across executed trades
+  and subtracted from the rebalanced portfolio's expected return (net-of-fee).
+
+### Importing IBKR positions
+
+Drag an Interactive Brokers **position report** or **activity statement** CSV
+onto the uploader in the main panel. The parser locates `Symbol`/`Ticker` and
+`Quantity`/`Shares` columns (handling both the flat Flex-Query export and the
+multi-section activity statement), auto-fills the holdings table and runs the
+optimisation immediately.
 
 ---
 
@@ -110,7 +143,10 @@ unit-tested or reused in other front-ends.
   from `R_f` on the Y-axis is tangent to the efficient frontier.
 - **Capital Market Line**: `μ = R_f + Sharpe_tangency · σ`.
 
-All optimisation is **long-only** (`0 ≤ w ≤ 1`, no shorting/leverage).
+All optimisation is **long-only** with an optional per-asset cap
+(`0 ≤ wᵢ ≤ w_max`, no shorting/leverage). The Black-Litterman model replaces the
+historical `μ` with the market-implied equilibrium prior anchored to the
+benchmark.
 
 ---
 

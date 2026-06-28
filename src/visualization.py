@@ -140,7 +140,27 @@ def efficient_frontier_figure(
             )
         )
 
-    # ---- 7. Current portfolio ----
+    # ---- 7. Market benchmark reference point ----
+    if result.benchmark is not None:
+        b = result.benchmark
+        fig.add_trace(
+            go.Scatter(
+                x=[b.volatility * 100],
+                y=[b.expected_return * 100],
+                mode="markers",
+                name=b.name,
+                marker=dict(symbol="star-diamond", size=18, color="#FFD700",
+                            line=dict(width=1.5, color="black")),
+                hovertemplate=(
+                    f"<b>{b.name}</b><br>"
+                    f"Return: {b.expected_return * 100:.2f}%<br>"
+                    f"Volatility: {b.volatility * 100:.2f}%<br>"
+                    f"Sharpe: {b.sharpe:.2f}<extra></extra>"
+                ),
+            )
+        )
+
+    # ---- 8. Current portfolio ----
     if current is not None:
         fig.add_trace(
             go.Scatter(
@@ -181,18 +201,21 @@ def correlation_heatmap(corr) -> go.Figure:
             z=corr.values,
             x=list(corr.columns),
             y=list(corr.index),
-            colorscale="RdBu",
+            colorscale="RdBu_r",
             zmid=0,
             zmin=-1,
             zmax=1,
             text=np.round(corr.values, 2),
             texttemplate="%{text}",
-            colorbar=dict(title="ρ"),
+            textfont=dict(size=12),
+            colorbar=dict(title="ρ", tickvals=[-1, -0.5, 0, 0.5, 1]),
+            hovertemplate="%{y} vs %{x}<br>ρ = %{z:.2f}<extra></extra>",
         )
     )
     fig.update_layout(
-        title="Asset correlation matrix (ρ)",
+        title="Asset correlation matrix (ρ) — red = diversifying, blue = correlated",
         template="plotly_white",
-        height=420,
+        height=460,
+        yaxis=dict(autorange="reversed"),
     )
     return fig

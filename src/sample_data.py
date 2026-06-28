@@ -72,16 +72,23 @@ def generate_sample_prices(
     lookback_years: float = DEFAULT_LOOKBACK_YEARS,
     end: dt.date | None = None,
     seed: int = 27,
+    benchmark: str | None = None,
 ) -> PriceData:
     """Synthesise a correlated daily close-price panel for ``tickers``.
 
     The output mirrors :class:`~src.data_loader.PriceData` so it is a drop-in
-    replacement for the live download path.
+    replacement for the live download path. When ``benchmark`` is supplied it is
+    generated with the same factor model and returned separately.
     """
     symbols = [str(t).strip().upper() for t in tickers if str(t).strip()]
     symbols = list(dict.fromkeys(symbols))  # de-dupe, preserve order
     if not symbols:
         raise PriceDataError("No valid tickers were provided.")
+
+    bench = str(benchmark).strip().upper() if benchmark else None
+    all_symbols = list(symbols)
+    if bench and bench not in all_symbols:
+        all_symbols.append(bench)
 
     end = end or dt.date.today()
     n_days = max(int(round(lookback_years * TRADING_DAYS_PER_YEAR)), 60)
@@ -91,12 +98,12 @@ def generate_sample_prices(
     market = rng.standard_normal(n_days)
 
     # One shared factor per distinct sector among the requested tickers.
-    sectors = {sec for _, _, sec in (_profile_for(s) for s in symbols)}
+    sectors = {sec for _, _, sec in (_profile_for(s) for s in all_symbols)}
     sector_factors = {sec: rng.standard_normal(n_days) for sec in sectors}
 
     sqrt_days = float(np.sqrt(TRADING_DAYS_PER_YEAR))
     columns: dict[str, np.ndarray] = {}
-    for symbol in symbols:
+    for symbol in all_symbols:
         annual_return, annual_vol, sector = _profile_for(symbol)
         mu_daily = np.log1p(annual_return) / TRADING_DAYS_PER_YEAR
         sigma_daily = annual_vol / sqrt_days
@@ -109,7 +116,10 @@ def generate_sample_prices(
         log_rets = mu_daily + sigma_daily * shock
         columns[symbol] = 100.0 * np.exp(np.cumsum(log_rets))
 
-    prices = pd.DataFrame(columns, index=dates)
+    panel = pd.DataFrame(columns, index=dates)
+    prices = panel[symbols]
+    benchmark_prices = panel[bench] if bench else None
+
     return PriceData(
         prices=prices,
         latest_prices=prices.iloc[-1],
@@ -117,15 +127,18 @@ def generate_sample_prices(
         failed_tickers=[],
         start=prices.index[0].date(),
         end=prices.index[-1].date(),
+        benchmark_ticker=bench,
+        benchmark_prices=benchmark_prices,
     )
 
 
-def load_prices_from_csv(file, tickers=None) -> PriceData:
+def load_prices_from_csv(file, tickers=None, benchmark: str | None = None) -> PriceData:
     """Load a close-price panel from an uploaded CSV.
 
     The CSV must have a date column (first column or named ``Date``) and one
     column of close prices per ticker. If ``tickers`` is given, only those
-    columns are kept (others are reported as failed).
+    columns are kept (others are reported as failed). If ``benchmark`` is given
+    and present as a column, it is returned separately.
     """
     if hasattr(file, "read"):
         raw = file.read()
@@ -145,18 +158,29 @@ def load_prices_from_csv(file, tickers=None) -> PriceData:
     # Keep numeric price columns only.
     prices = df.apply(pd.to_numeric, errors="coerce")
     prices = prices.dropna(axis=1, how="all").ffill()
+    prices.columns = [str(c).strip().upper() for c in prices.columns]
 
-    requested = None
+    bench = str(benchmark).strip().upper() if benchmark else None
+
     failed: list[str] = []
     if tickers:
         requested = [str(t).strip().upper() for t in tickers if str(t).strip()]
-        prices.columns = [str(c).strip().upper() for c in prices.columns]
         available = [t for t in requested if t in prices.columns]
         failed = [t for t in requested if t not in prices.columns]
-        if available:
-            prices = prices[available]
+        keep = available + ([bench] if bench and bench in prices.columns else [])
+        if keep:
+            prices = prices[list(dict.fromkeys(keep))]
 
     prices = prices.dropna(how="any")
+
+    # Split out the benchmark column if present.
+    benchmark_prices = None
+    if bench and bench in prices.columns:
+        benchmark_prices = prices[bench]
+        asset_cols = [c for c in prices.columns if c != bench or (tickers and bench in
+                      [str(t).strip().upper() for t in tickers])]
+        prices = prices[asset_cols]
+
     if prices.shape[0] < 2 or prices.shape[1] < 1:
         raise PriceDataError(
             "Not enough usable price data in the CSV (need a date column and at "
@@ -170,4 +194,6 @@ def load_prices_from_csv(file, tickers=None) -> PriceData:
         failed_tickers=failed,
         start=prices.index[0].date(),
         end=prices.index[-1].date(),
+        benchmark_ticker=bench if benchmark_prices is not None else None,
+        benchmark_prices=benchmark_prices,
     )

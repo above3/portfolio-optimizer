@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import pandas as pd
 import yfinance as yf
 
-from .config import DEFAULT_LOOKBACK_YEARS
+from .config import DEFAULT_LOOKBACK_YEARS, RISK_FREE_TICKER
 
 
 class PriceDataError(RuntimeError):
@@ -35,6 +35,11 @@ class PriceData:
         Requested tickers that were dropped (no data / all NaN).
     start, end:
         The actual date bounds of the returned series.
+    benchmark_ticker:
+        Symbol of the market benchmark, if one was requested.
+    benchmark_prices:
+        Close-price series of the benchmark aligned to ``prices`` index, or
+        ``None`` when no benchmark was requested / available.
     """
 
     prices: pd.DataFrame
@@ -43,6 +48,8 @@ class PriceData:
     failed_tickers: list[str]
     start: dt.date
     end: dt.date
+    benchmark_ticker: str | None = None
+    benchmark_prices: pd.Series | None = None
 
 
 def _normalise_tickers(tickers) -> list[str]:
@@ -77,10 +84,51 @@ def _extract_close(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
     return close
 
 
+def fetch_risk_free_rate(
+    ticker: str = RISK_FREE_TICKER,
+    lookback_days: int = 10,
+) -> float:
+    """Fetch the latest US 3-Month Treasury Bill yield as a decimal.
+
+    Yahoo Finance quotes ``^IRX`` as an annualised percentage (e.g. ``5.21``
+    means 5.21%), so the value is divided by 100 to return a decimal rate
+    suitable for the tangency-portfolio / CML calculations.
+
+    Raises
+    ------
+    PriceDataError
+        If the yield cannot be downloaded or parsed.
+    """
+    end = dt.date.today()
+    start = end - dt.timedelta(days=max(lookback_days, 5))
+    try:
+        raw = yf.download(
+            ticker,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - network/library errors
+        raise PriceDataError(f"Could not fetch risk-free rate ({ticker}): {exc}")
+
+    close = _extract_close(raw, [ticker])
+    series = close.dropna(how="all").ffill().dropna(how="any")
+    if series.empty:
+        raise PriceDataError(f"No data returned for risk-free ticker {ticker}.")
+
+    latest_yield_pct = float(series.iloc[-1, 0])
+    if not (-1.0 < latest_yield_pct < 100.0):
+        raise PriceDataError(f"Implausible risk-free yield parsed: {latest_yield_pct}.")
+    return latest_yield_pct / 100.0
+
+
 def fetch_price_history(
     tickers,
     lookback_years: float = DEFAULT_LOOKBACK_YEARS,
     end: dt.date | None = None,
+    benchmark: str | None = None,
 ) -> PriceData:
     """Download and clean daily close prices for ``tickers``.
 
@@ -92,6 +140,9 @@ def fetch_price_history(
         Size of the historical window in years.
     end:
         Optional end date (defaults to today).
+    benchmark:
+        Optional market-benchmark symbol fetched alongside the assets and
+        returned separately (aligned to the asset window).
 
     Returns
     -------
@@ -106,11 +157,16 @@ def fetch_price_history(
     if not symbols:
         raise PriceDataError("No valid tickers were provided.")
 
+    bench = str(benchmark).strip().upper() if benchmark else None
+    download_symbols = list(symbols)
+    if bench and bench not in download_symbols:
+        download_symbols.append(bench)
+
     end = end or dt.date.today()
     start = end - dt.timedelta(days=int(round(lookback_years * 365.25)))
 
     raw = yf.download(
-        symbols,
+        download_symbols,
         start=start.isoformat(),
         end=end.isoformat(),
         auto_adjust=True,
@@ -118,7 +174,7 @@ def fetch_price_history(
         threads=True,
     )
 
-    close = _extract_close(raw, symbols)
+    close = _extract_close(raw, download_symbols)
     if close.empty:
         raise PriceDataError(
             "Could not download any price data. Check the ticker symbols "
@@ -140,6 +196,13 @@ def fetch_price_history(
             "Try a longer lookback or different tickers."
         )
 
+    # Align the benchmark (if available) to the cleaned asset window.
+    benchmark_prices = None
+    if bench and bench in close.columns:
+        benchmark_prices = close[bench].reindex(prices.index).ffill().dropna()
+        if benchmark_prices.empty:
+            benchmark_prices = None
+
     return PriceData(
         prices=prices,
         latest_prices=prices.iloc[-1],
@@ -147,4 +210,6 @@ def fetch_price_history(
         failed_tickers=failed,
         start=prices.index[0].date(),
         end=prices.index[-1].date(),
+        benchmark_ticker=bench if benchmark_prices is not None else None,
+        benchmark_prices=benchmark_prices,
     )
