@@ -30,8 +30,11 @@ from pypfopt.black_litterman import (
 from .config import (
     DEFAULT_MAX_WEIGHT,
     DEFAULT_N_SIMULATIONS,
+    GBM_N_PATHS,
+    GBM_STEPS_PER_YEAR,
     N_FRONTIER_POINTS,
     TRADING_DAYS_PER_YEAR,
+    UNKNOWN_SECTOR,
 )
 
 
@@ -93,6 +96,8 @@ class FrontierResult:
     max_weight: float = DEFAULT_MAX_WEIGHT
     returns_model: str = "historical"
     anchor: AnchorConstraint | None = None
+    sector_map: dict[str, str] = field(default_factory=dict)
+    sector_max: float = 1.0
     notes: list[str] = field(default_factory=list)
 
 
@@ -307,13 +312,38 @@ def _build_bounds(
     return bounds
 
 
-def _ef(mu: pd.Series, cov: pd.DataFrame,
-        bounds: list[tuple[float, float]]) -> EfficientFrontier:
-    """A fresh EfficientFrontier with explicit per-asset bounds.
+def _apply_sector_constraints(
+    ef: EfficientFrontier,
+    assets: list[str],
+    sector_map: dict[str, str] | None,
+    sector_max: float | None,
+) -> None:
+    """Add ``sum(w in sector) <= sector_max`` constraints, skipping 'Unknown'.
+
+    PyPortfolioOpt transforms these linear constraints correctly even under the
+    ``max_sharpe`` reformulation (verified empirically).
+    """
+    if not sector_map or sector_max is None or sector_max >= 1.0:
+        return
+    mapper = {a: str(sector_map.get(a, UNKNOWN_SECTOR) or UNKNOWN_SECTOR) for a in assets}
+    constrained = {s for s in mapper.values() if s and s != UNKNOWN_SECTOR}
+    if not constrained:
+        return
+    upper = {s: float(sector_max) for s in constrained}
+    ef.add_sector_constraints(mapper, {}, upper)
+
+
+def _ef(
+    mu: pd.Series, cov: pd.DataFrame, bounds: list[tuple[float, float]],
+    sector_map: dict[str, str] | None = None, sector_max: float | None = None,
+) -> EfficientFrontier:
+    """A fresh EfficientFrontier with per-asset bounds + optional sector caps.
 
     PyPortfolioOpt mutates instances in place, so a new one is built per solve.
     """
-    return EfficientFrontier(mu, cov, weight_bounds=bounds)
+    ef = EfficientFrontier(mu, cov, weight_bounds=bounds)
+    _apply_sector_constraints(ef, list(mu.index), sector_map, sector_max)
+    return ef
 
 
 def _max_return_given_bounds(
@@ -340,12 +370,23 @@ def min_variance_portfolio(
     mu: pd.Series, cov: pd.DataFrame, risk_free_rate: float,
     max_weight: float = DEFAULT_MAX_WEIGHT,
     anchor: AnchorConstraint | None = None,
+    sector_map: dict[str, str] | None = None,
+    sector_max: float = 1.0,
 ) -> PortfolioPoint:
-    """The long-only Minimum-Variance Portfolio."""
+    """The long-only Minimum-Variance Portfolio.
+
+    If sector constraints make the problem infeasible, they are dropped (so the
+    app never crashes) and the unconstrained MVP is returned.
+    """
     bounds = _build_bounds(list(mu.index), max_weight, anchor)
-    ef = _ef(mu, cov, bounds)
-    ef.min_volatility()
-    weights = dict(ef.clean_weights())
+    try:
+        ef = _ef(mu, cov, bounds, sector_map, sector_max)
+        ef.min_volatility()
+        weights = dict(ef.clean_weights())
+    except Exception:  # noqa: BLE001 - sector caps infeasible -> drop them
+        ef = _ef(mu, cov, bounds)
+        ef.min_volatility()
+        weights = dict(ef.clean_weights())
     return _make_point("Minimum Variance", weights, mu, cov, risk_free_rate)
 
 
@@ -353,20 +394,24 @@ def max_sharpe_portfolio(
     mu: pd.Series, cov: pd.DataFrame, risk_free_rate: float,
     max_weight: float = DEFAULT_MAX_WEIGHT,
     anchor: AnchorConstraint | None = None,
+    sector_map: dict[str, str] | None = None,
+    sector_max: float = 1.0,
 ) -> PortfolioPoint | None:
     """The Tangency (max-Sharpe) portfolio for the given risk-free rate.
 
-    Returns ``None`` if no long-only portfolio can beat the risk-free rate
-    (PyPortfolioOpt raises in that situation).
+    Returns ``None`` if no long-only portfolio can beat the risk-free rate. If
+    sector caps make it infeasible, they are dropped before giving up.
     """
     bounds = _build_bounds(list(mu.index), max_weight, anchor)
-    ef = _ef(mu, cov, bounds)
-    try:
-        ef.max_sharpe(risk_free_rate=risk_free_rate)
-    except Exception:  # noqa: BLE001 - surface as "no tangency" to the caller
-        return None
-    weights = dict(ef.clean_weights())
-    return _make_point("Maximum Sharpe (Tangency)", weights, mu, cov, risk_free_rate)
+    for sm, smax in ((sector_map, sector_max), (None, 1.0)):
+        ef = _ef(mu, cov, bounds, sm, smax)
+        try:
+            ef.max_sharpe(risk_free_rate=risk_free_rate)
+        except Exception:  # noqa: BLE001 - retry without sector caps, then give up
+            continue
+        weights = dict(ef.clean_weights())
+        return _make_point("Maximum Sharpe (Tangency)", weights, mu, cov, risk_free_rate)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -378,14 +423,16 @@ def efficient_frontier_curve(
     n_points: int = N_FRONTIER_POINTS,
     max_weight: float = DEFAULT_MAX_WEIGHT,
     anchor: AnchorConstraint | None = None,
+    sector_map: dict[str, str] | None = None,
+    sector_max: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Trace the efficient frontier as ``(volatilities, returns)`` arrays.
 
     The curve is sampled between the MVP return and the maximum attainable
-    return given the per-asset weight cap and any core-anchor constraint.
+    return given the per-asset cap, the core-anchor and the sector guardrails.
     """
     bounds = _build_bounds(list(mu.index), max_weight, anchor)
-    mvp = min_variance_portfolio(mu, cov, 0.0, max_weight, anchor)
+    mvp = min_variance_portfolio(mu, cov, 0.0, max_weight, anchor, sector_map, sector_max)
     r_min = mvp.expected_return
     r_max = _max_return_given_bounds(mu, bounds)
 
@@ -396,7 +443,7 @@ def efficient_frontier_curve(
     vols: list[float] = []
     rets: list[float] = []
     for target in targets:
-        ef = _ef(mu, cov, bounds)
+        ef = _ef(mu, cov, bounds, sector_map, sector_max)
         try:
             ef.efficient_return(target_return=float(target))
         except Exception:  # noqa: BLE001 - skip infeasible targets
@@ -492,13 +539,15 @@ def analyse(
     benchmark_ticker: str | None = None,
     market_caps: pd.Series | dict | None = None,
     anchor: AnchorConstraint | None = None,
+    sector_map: dict[str, str] | None = None,
+    sector_max: float = 1.0,
 ) -> FrontierResult:
     """Run a full MPT analysis on a price history.
 
     Single entry point the UI calls; it wires together input estimation, the
-    named optimal portfolios (subject to the per-asset cap and core anchor), the
-    frontier curve, the Monte-Carlo cloud, the benchmark point and any
-    model-fallback notes.
+    named optimal portfolios (subject to the per-asset cap, the core anchor and
+    the sector guardrails), the frontier curve, the Monte-Carlo cloud, the
+    benchmark point and any model-fallback notes.
     """
     cov = estimate_covariance(prices, cov_method=cov_method)
     mu, model_used, note = compute_expected_returns(
@@ -508,11 +557,13 @@ def analyse(
     )
     corr = correlation_from_covariance(cov)
 
-    mvp = min_variance_portfolio(mu, cov, risk_free_rate, max_weight, anchor)
-    tangency = max_sharpe_portfolio(mu, cov, risk_free_rate, max_weight, anchor)
+    mvp = min_variance_portfolio(mu, cov, risk_free_rate, max_weight, anchor,
+                                 sector_map, sector_max)
+    tangency = max_sharpe_portfolio(mu, cov, risk_free_rate, max_weight, anchor,
+                                    sector_map, sector_max)
 
     frontier_vol, frontier_ret = efficient_frontier_curve(
-        mu, cov, n_frontier_points, max_weight, anchor
+        mu, cov, n_frontier_points, max_weight, anchor, sector_map, sector_max
     )
     random_vol, random_ret, random_sharpe = random_portfolios(
         mu, cov, risk_free_rate, n_samples=n_simulations
@@ -539,6 +590,8 @@ def analyse(
         max_weight=_clamp_max_weight(max_weight, len(mu)),
         returns_model=model_used,
         anchor=anchor,
+        sector_map=dict(sector_map or {}),
+        sector_max=sector_max,
         notes=notes,
     )
 
@@ -556,12 +609,14 @@ def screen_watchlist(
     anchor: AnchorConstraint | None = None,
     returns_model: str = "historical",
     benchmark_prices: pd.Series | None = None,
+    sector_map: dict[str, str] | None = None,
+    sector_max: float = 1.0,
 ) -> tuple[float, list[WatchlistRecommendation]]:
     """Quantify the diversification impact of each watchlist candidate.
 
     For every candidate, the tangency portfolio is re-optimised over
-    ``base_tickers + [candidate]`` (under the same cap/anchor) and compared to
-    the baseline tangency over ``base_tickers`` alone.
+    ``base_tickers + [candidate]`` (under the same cap/anchor/sector caps) and
+    compared to the baseline tangency over ``base_tickers`` alone.
 
     Returns ``(base_sharpe, recommendations sorted by Sharpe improvement)``.
     """
@@ -575,7 +630,7 @@ def screen_watchlist(
         benchmark_prices=benchmark_prices, risk_free_rate=risk_free_rate,
     )
     base_tan = max_sharpe_portfolio(base_mu, base_cov, risk_free_rate,
-                                    max_weight, anchor)
+                                    max_weight, anchor, sector_map, sector_max)
     base_sharpe = base_tan.sharpe if base_tan is not None else float("nan")
 
     recs: list[WatchlistRecommendation] = []
@@ -591,7 +646,8 @@ def screen_watchlist(
             prices[pool], cov, returns_model=returns_model,
             benchmark_prices=benchmark_prices, risk_free_rate=risk_free_rate,
         )
-        tan = max_sharpe_portfolio(mu, cov, risk_free_rate, max_weight, anchor)
+        tan = max_sharpe_portfolio(mu, cov, risk_free_rate, max_weight, anchor,
+                                   sector_map, sector_max)
 
         corr = correlation_from_covariance(cov)
         avg_corr = float(corr.loc[candidate, base].abs().mean())
@@ -618,3 +674,161 @@ def screen_watchlist(
     recs.sort(key=lambda r: (r.sharpe_delta if r.feasible else float("-inf")),
               reverse=True)
     return base_sharpe, recs
+
+
+# --------------------------------------------------------------------------- #
+# Geometric Brownian Motion wealth projection
+# --------------------------------------------------------------------------- #
+@dataclass
+class WealthProjection:
+    """Output of a GBM Monte-Carlo wealth simulation (monthly steps)."""
+
+    times_years: np.ndarray
+    p10: np.ndarray
+    p50: np.ndarray
+    p90: np.ndarray
+    mean_path: np.ndarray
+    initial_capital: float
+    monthly_contribution: float
+    horizon_years: float
+    mu: float
+    sigma: float
+    n_paths: int
+    total_contributed: float
+
+    @property
+    def final_p10(self) -> float:
+        return float(self.p10[-1])
+
+    @property
+    def final_p50(self) -> float:
+        return float(self.p50[-1])
+
+    @property
+    def final_p90(self) -> float:
+        return float(self.p90[-1])
+
+
+def simulate_gbm_wealth(
+    initial_capital: float,
+    mu: float,
+    sigma: float,
+    horizon_years: float,
+    monthly_contribution: float = 0.0,
+    n_paths: int = GBM_N_PATHS,
+    steps_per_year: int = GBM_STEPS_PER_YEAR,
+    seed: int | None = 42,
+) -> WealthProjection:
+    """Project wealth under Geometric Brownian Motion ``dS = μ S dt + σ S dW``.
+
+    The portfolio's annualised ``mu``/``sigma`` (from the tangency portfolio)
+    drive the drift and diffusion; ``monthly_contribution`` is injected at the
+    end of every step. Returns the 10th/50th/90th percentile bands plus the mean
+    path across ``n_paths`` simulations.
+    """
+    steps = max(int(round(horizon_years * steps_per_year)), 1)
+    dt = 1.0 / steps_per_year
+    drift = (mu - 0.5 * sigma**2) * dt
+    diffusion = sigma * float(np.sqrt(dt))
+
+    rng = np.random.default_rng(seed)
+    wealth = np.full(n_paths, float(initial_capital), dtype=float)
+    paths = np.empty((steps + 1, n_paths), dtype=float)
+    paths[0] = wealth
+    for s in range(1, steps + 1):
+        z = rng.standard_normal(n_paths)
+        wealth = wealth * np.exp(drift + diffusion * z) + monthly_contribution
+        paths[s] = wealth
+
+    return WealthProjection(
+        times_years=np.arange(steps + 1) / steps_per_year,
+        p10=np.percentile(paths, 10, axis=1),
+        p50=np.percentile(paths, 50, axis=1),
+        p90=np.percentile(paths, 90, axis=1),
+        mean_path=paths.mean(axis=1),
+        initial_capital=float(initial_capital),
+        monthly_contribution=float(monthly_contribution),
+        horizon_years=float(horizon_years),
+        mu=float(mu),
+        sigma=float(sigma),
+        n_paths=int(n_paths),
+        total_contributed=float(initial_capital) + float(monthly_contribution) * steps,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Historical backtesting (equity curves + diagnostics)
+# --------------------------------------------------------------------------- #
+@dataclass
+class BacktestResult:
+    """Normalised equity curves and risk diagnostics for competing allocations."""
+
+    curves: pd.DataFrame        # base-100 curves, one column per strategy
+    diagnostics: pd.DataFrame   # index=strategy; Cumulative Return %, Sharpe, Max DD %
+
+
+def _diagnostics_from_returns(
+    daily_returns: pd.Series, risk_free_rate: float, frequency: int
+) -> tuple[pd.Series, float, float, float]:
+    """Return ``(curve, cumulative_return, ann_sharpe, max_drawdown)``."""
+    daily_returns = daily_returns.dropna()
+    curve = 100.0 * (1.0 + daily_returns).cumprod()
+    if curve.empty:
+        return curve, float("nan"), float("nan"), float("nan")
+    cumulative = float(curve.iloc[-1] / 100.0 - 1.0)
+    ann_ret = float((1.0 + daily_returns.mean()) ** frequency - 1.0)
+    ann_vol = float(daily_returns.std(ddof=1) * np.sqrt(frequency))
+    sharpe = (ann_ret - risk_free_rate) / ann_vol if ann_vol > 0 else float("nan")
+    drawdown = curve / curve.cummax() - 1.0
+    max_dd = float(drawdown.min())
+    return curve, cumulative, sharpe, max_dd
+
+
+def backtest_equity_curves(
+    prices: pd.DataFrame,
+    weight_sets: dict[str, dict[str, float]],
+    risk_free_rate: float,
+    benchmark_prices: pd.Series | None = None,
+    benchmark_name: str | None = None,
+    frequency: int = TRADING_DAYS_PER_YEAR,
+) -> BacktestResult:
+    """Reconstruct base-100 equity curves for fixed-weight allocations.
+
+    Each entry in ``weight_sets`` (e.g. the current and optimised portfolios) is
+    held at constant weights (daily-rebalanced) over the price history. The
+    benchmark, if supplied, is added as a buy-and-hold single-asset curve.
+    """
+    daily = prices.pct_change()
+    curves: dict[str, pd.Series] = {}
+    diag_rows: dict[str, dict[str, float]] = {}
+
+    for name, weights in weight_sets.items():
+        w = pd.Series(weights, dtype=float).reindex(prices.columns).fillna(0.0)
+        total = w.sum()
+        if total <= 0:
+            continue
+        w = w / total
+        port_ret = daily.mul(w, axis=1).sum(axis=1)
+        curve, cum, sharpe, max_dd = _diagnostics_from_returns(
+            port_ret, risk_free_rate, frequency)
+        curves[name] = curve
+        diag_rows[name] = {
+            "Cumulative Return %": round(cum * 100, 2),
+            "Annualised Sharpe": round(sharpe, 2),
+            "Max Drawdown %": round(max_dd * 100, 2),
+        }
+
+    if benchmark_prices is not None and benchmark_name:
+        bench_ret = benchmark_prices.reindex(prices.index).ffill().pct_change()
+        curve, cum, sharpe, max_dd = _diagnostics_from_returns(
+            bench_ret, risk_free_rate, frequency)
+        curves[benchmark_name] = curve
+        diag_rows[benchmark_name] = {
+            "Cumulative Return %": round(cum * 100, 2),
+            "Annualised Sharpe": round(sharpe, 2),
+            "Max Drawdown %": round(max_dd * 100, 2),
+        }
+
+    curves_df = pd.DataFrame(curves)
+    diagnostics_df = pd.DataFrame(diag_rows).T
+    return BacktestResult(curves=curves_df, diagnostics=diagnostics_df)

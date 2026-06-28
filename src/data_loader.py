@@ -7,12 +7,12 @@ the financial engine can be unit-tested or reused outside the web app.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 import yfinance as yf
 
-from .config import DEFAULT_LOOKBACK_YEARS, RISK_FREE_TICKER
+from .config import DEFAULT_LOOKBACK_YEARS, RISK_FREE_TICKER, UNKNOWN_SECTOR
 
 
 class PriceDataError(RuntimeError):
@@ -40,6 +40,15 @@ class PriceData:
     benchmark_prices:
         Close-price series of the benchmark aligned to ``prices`` index, or
         ``None`` when no benchmark was requested / available.
+    currencies:
+        Native currency per ticker (after any normalisation this equals the
+        base currency for converted assets).
+    sectors:
+        Sector group per ticker (``"Unknown"`` when unavailable).
+    base_currency:
+        The currency all prices/values are expressed in, or ``None``.
+    notes:
+        Human-readable notes about fallbacks (failed FX / metadata fetches).
     """
 
     prices: pd.DataFrame
@@ -50,6 +59,10 @@ class PriceData:
     end: dt.date
     benchmark_ticker: str | None = None
     benchmark_prices: pd.Series | None = None
+    currencies: dict[str, str] = field(default_factory=dict)
+    sectors: dict[str, str] = field(default_factory=dict)
+    base_currency: str | None = None
+    notes: list[str] = field(default_factory=list)
 
 
 def _normalise_tickers(tickers) -> list[str]:
@@ -124,11 +137,92 @@ def fetch_risk_free_rate(
     return latest_yield_pct / 100.0
 
 
+# --------------------------------------------------------------------------- #
+# Asset metadata (currency + sector) and FX normalisation
+# --------------------------------------------------------------------------- #
+def fetch_asset_metadata(
+    tickers,
+    default_currency: str = "USD",
+) -> dict[str, dict[str, str]]:
+    """Best-effort ``{ticker: {"currency": .., "sector": ..}}`` via yfinance.
+
+    Every lookup is wrapped in try/except so a blocked network or a missing
+    ``.info`` payload degrades to ``(default_currency, "Unknown")`` instead of
+    raising.
+    """
+    meta: dict[str, dict[str, str]] = {}
+    for ticker in _normalise_tickers(tickers):
+        currency, sector = default_currency, UNKNOWN_SECTOR
+        try:
+            info = yf.Ticker(ticker).info or {}
+            currency = str(info.get("currency", default_currency) or default_currency).upper()
+            sector = str(info.get("sector", UNKNOWN_SECTOR) or UNKNOWN_SECTOR)
+        except Exception:  # noqa: BLE001 - degrade gracefully
+            pass
+        meta[ticker] = {"currency": currency, "sector": sector}
+    return meta
+
+
+def fx_pair_ticker(from_ccy: str, to_ccy: str) -> str:
+    """Yahoo FX symbol giving ``to_ccy`` per 1 ``from_ccy`` (e.g. ``USDEUR=X``)."""
+    return f"{from_ccy.upper()}{to_ccy.upper()}=X"
+
+
+def fetch_fx_series(
+    from_ccy: str,
+    to_ccy: str,
+    start: dt.date,
+    end: dt.date,
+) -> pd.Series:
+    """Daily FX conversion factor series (``to_ccy`` per 1 ``from_ccy``).
+
+    Raises ``PriceDataError`` on failure so callers can fall back gracefully.
+    """
+    if from_ccy.upper() == to_ccy.upper():
+        raise PriceDataError("No FX conversion needed for identical currencies.")
+    pair = fx_pair_ticker(from_ccy, to_ccy)
+    try:
+        raw = yf.download(pair, start=start.isoformat(), end=end.isoformat(),
+                          auto_adjust=True, progress=False, threads=False)
+    except Exception as exc:  # noqa: BLE001
+        raise PriceDataError(f"Could not fetch FX rate {pair}: {exc}")
+    close = _extract_close(raw, [pair]).dropna(how="all").ffill().dropna(how="any")
+    if close.empty:
+        raise PriceDataError(f"No FX data returned for {pair}.")
+    series = close.iloc[:, 0]
+    series.name = pair
+    return series
+
+
+def convert_to_base_currency(
+    prices: pd.DataFrame,
+    currency_map: dict[str, str],
+    base_currency: str,
+    fx_series_map: dict[str, pd.Series],
+) -> pd.DataFrame:
+    """Convert every column of ``prices`` into ``base_currency``.
+
+    Pure function (no network): ``fx_series_map`` maps a *source* currency to a
+    factor series giving ``base`` per 1 unit of that currency. Columns already
+    in the base currency (or without a usable factor) are left unchanged.
+    """
+    base = base_currency.upper()
+    converted = prices.copy()
+    for ticker in prices.columns:
+        ccy = str(currency_map.get(ticker, base)).upper()
+        if ccy == base or ccy not in fx_series_map:
+            continue
+        factor = fx_series_map[ccy].reindex(prices.index).ffill().bfill()
+        converted[ticker] = prices[ticker].to_numpy() * factor.to_numpy()
+    return converted
+
+
 def fetch_price_history(
     tickers,
     lookback_years: float = DEFAULT_LOOKBACK_YEARS,
     end: dt.date | None = None,
     benchmark: str | None = None,
+    base_currency: str | None = None,
 ) -> PriceData:
     """Download and clean daily close prices for ``tickers``.
 
@@ -143,6 +237,10 @@ def fetch_price_history(
     benchmark:
         Optional market-benchmark symbol fetched alongside the assets and
         returned separately (aligned to the asset window).
+    base_currency:
+        If set (``"EUR"``/``"USD"``), every asset's native currency is detected
+        and foreign series are converted into this base via live FX rates, with
+        graceful fallback (left native + a note) when FX can't be fetched.
 
     Returns
     -------
@@ -203,6 +301,33 @@ def fetch_price_history(
         if benchmark_prices.empty:
             benchmark_prices = None
 
+    # ---- Metadata (currency + sector) and FX normalisation ----
+    notes: list[str] = []
+    meta_symbols = list(valid) + ([bench] if benchmark_prices is not None else [])
+    metadata = fetch_asset_metadata(meta_symbols, default_currency=base_currency or "USD")
+    currencies = {t: metadata.get(t, {}).get("currency", base_currency or "USD")
+                  for t in meta_symbols}
+    sectors = {t: metadata.get(t, {}).get("sector", UNKNOWN_SECTOR) for t in valid}
+
+    if base_currency:
+        base = base_currency.upper()
+        foreign = {c for c in currencies.values() if c and c != base}
+        fx_series_map: dict[str, pd.Series] = {}
+        for ccy in foreign:
+            try:
+                fx_series_map[ccy] = fetch_fx_series(ccy, base, start, end)
+            except PriceDataError as exc:
+                notes.append(f"FX {ccy}->{base} unavailable; left in native currency. ({exc})")
+        if fx_series_map:
+            prices = convert_to_base_currency(prices, currencies, base, fx_series_map)
+            if benchmark_prices is not None and bench in currencies:
+                bench_frame = convert_to_base_currency(
+                    benchmark_prices.to_frame(), {bench: currencies[bench]},
+                    base, fx_series_map)
+                benchmark_prices = bench_frame.iloc[:, 0]
+        # After conversion, every asset is reported in the base currency.
+        currencies = {t: base for t in currencies}
+
     return PriceData(
         prices=prices,
         latest_prices=prices.iloc[-1],
@@ -212,4 +337,8 @@ def fetch_price_history(
         end=prices.index[-1].date(),
         benchmark_ticker=bench if benchmark_prices is not None else None,
         benchmark_prices=benchmark_prices,
+        currencies={t: currencies.get(t, base_currency or "USD") for t in valid},
+        sectors=sectors,
+        base_currency=base_currency,
+        notes=notes,
     )

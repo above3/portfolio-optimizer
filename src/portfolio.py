@@ -17,10 +17,39 @@ import math
 import re
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
+from .config import (
+    DEFAULT_ASSET_TYPE,
+    TAX_RATE_BOND,
+    TAX_RATE_EQUITY,
+    UNKNOWN_SECTOR,
+)
 from .data_loader import PriceDataError
 from .optimizer import performance
+
+# Substrings hinting that a ticker is a bond / fixed-income instrument.
+_BOND_HINTS: tuple[str, ...] = (
+    "AGG", "BND", "BOND", "TLT", "IEF", "SHY", "GOVT", "EMB", "EMBE",
+    "BTP", "BUND", "TIP", "VGEA", "IBGL", "XGLE", "GLAB",
+)
+
+
+def guess_asset_type(ticker: str) -> str:
+    """Heuristically classify a ticker as a bond or an equity/ETF."""
+    upper = str(ticker).upper()
+    root = upper.split(".")[0]
+    if any(hint in root for hint in _BOND_HINTS):
+        return "Bond/Fixed Income"
+    return DEFAULT_ASSET_TYPE
+
+
+def tax_rate_for(asset_type: str | None) -> float:
+    """Italian capital-gains rate for an asset type (26% equity, 12.5% bond)."""
+    if asset_type and "bond" in str(asset_type).lower():
+        return TAX_RATE_BOND
+    return TAX_RATE_EQUITY
 
 
 @dataclass
@@ -185,7 +214,12 @@ def _aggregate_positions(
         if qty == 0:
             continue
         avg_price = round(priced_value / priced_qty, 4) if priced_qty > 0 else None
-        rows.append({"Ticker": sym, "Shares": qty, "Purchase Price": avg_price})
+        rows.append({
+            "Ticker": sym,
+            "Shares": qty,
+            "Purchase Price": avg_price,
+            "Asset Type": guess_asset_type(sym),
+        })
     if not rows:
         raise PriceDataError("No non-zero positions found in the IBKR file.")
     return pd.DataFrame(rows)
@@ -301,12 +335,18 @@ class ReallocationResult:
     achieved_weights: dict[str, float]
     residual_cash: float
     total_fees: float
+    total_tax: float
+    total_friction: float
     num_trades: int
     gross_return: float
     net_return: float
     allow_fractional: bool
     transaction_cost: float
+    tolerance: float
     investable_capital: float
+
+
+_HOLD_TOLERANCE = "HOLD / Within Tolerance"
 
 
 def reallocation_plan(
@@ -318,116 +358,327 @@ def reallocation_plan(
     risk_free_rate: float = 0.0,
     allow_fractional: bool = True,
     transaction_cost: float = 0.0,
+    tolerance: float = 0.0,
+    purchase_prices: dict[str, float] | None = None,
+    asset_types: dict[str, str] | None = None,
 ) -> ReallocationResult:
-    """Build a reallocation plan from current holdings to target weights.
+    """Build a friction- and tax-aware reallocation plan.
 
     Parameters
     ----------
     current_values:
-        Mapping of ticker -> current dollar value held (empty for a new
-        portfolio).
+        Ticker -> current value held (empty for a new portfolio).
     target_weights:
         Target weights (e.g. the tangency portfolio).
     investable_capital:
-        Capital the target weights are applied to (current value + new cash).
+        Capital the target weights apply to (active tranche capital).
     latest_prices:
         Latest close price per ticker, used to size trades in shares.
     mu:
-        Optional expected-return series; when provided, the achieved (post-trade)
-        gross and net-of-fee expected returns are computed.
-    risk_free_rate:
-        Reserved for callers that want to score residual cash (unused here).
+        Optional expected returns; enables gross/net achieved-return metrics.
     allow_fractional:
-        If ``False``, share trades are truncated to whole integers and the
-        undeployed remainder is reported as residual cash.
+        If ``False``, trades are truncated to whole shares (residual cash).
     transaction_cost:
-        Flat simulated cost charged per executed (non-zero) trade. Its total is
-        reported and subtracted from the expected return as a one-period drag.
+        Flat cost per executed trade.
+    tolerance:
+        If ``|w_current - w_target| < tolerance`` the asset is flagged
+        ``"HOLD / Within Tolerance"`` and not traded (avoids needless friction).
+    purchase_prices:
+        Average cost basis per ticker; drives realised-gain tax on SELLs.
+    asset_types:
+        Ticker -> 'Stock/ETF' | 'Bond/Fixed Income' for the Italian tax rate.
     """
+    purchase_prices = purchase_prices or {}
+    asset_types = asset_types or {}
     tickers = sorted(set(current_values) | set(target_weights))
     rows = []
     new_values: dict[str, float] = {}
     num_trades = 0
+    total_tax = 0.0
 
     for ticker in tickers:
         cur_val = float(current_values.get(ticker, 0.0) or 0.0)
         tgt_w = float(target_weights.get(ticker, 0.0))
-        target_value = tgt_w * investable_capital
+        cur_w = cur_val / investable_capital if investable_capital > 0 else 0.0
+        delta_w = tgt_w - cur_w
         price = float(latest_prices.get(ticker, 0.0) or 0.0)
 
-        dollar_delta = target_value - cur_val
-        raw_shares = dollar_delta / price if price > 0 else float("nan")
-
-        if not allow_fractional and price > 0:
-            # Round toward zero so we never overshoot the available capital.
-            traded_shares = math.trunc(raw_shares)
+        within_tol = abs(delta_w) < tolerance
+        if within_tol:
+            traded_shares: float = 0.0
         else:
-            traded_shares = raw_shares
+            raw_shares = (tgt_w * investable_capital - cur_val) / price if price > 0 \
+                else float("nan")
+            traded_shares = math.trunc(raw_shares) if (not allow_fractional and price > 0) \
+                else raw_shares
 
         executed_value = traded_shares * price if price > 0 else 0.0
         new_value = cur_val + executed_value
         new_values[ticker] = new_value
 
-        traded = price > 0 and abs(traded_shares) >= (1 if not allow_fractional else 1e-9)
+        traded = (not within_tol) and price > 0 and abs(traded_shares) >= (
+            1 if not allow_fractional else 1e-9)
         if traded:
             num_trades += 1
 
-        rows.append(
-            {
-                "Ticker": ticker,
-                "Current %": round(cur_val / investable_capital * 100, 2)
-                if investable_capital > 0 else 0.0,
-                "Target %": round(tgt_w * 100, 2),
-                "Δ Weight %": round(
-                    (tgt_w - (cur_val / investable_capital if investable_capital > 0 else 0.0))
-                    * 100, 2),
-                "Price $": round(price, 2) if price > 0 else None,
-                "Shares to trade": (
-                    int(traded_shares) if not allow_fractional and price > 0
-                    else (round(traded_shares, 4) if price > 0 else None)
-                ),
-                "Trade $": round(executed_value, 2) if price > 0 else None,
-                "Action": _action_label(tgt_w * investable_capital - cur_val),
-            }
-        )
+        # Capital-gains tax only on the SOLD portion of a profitable position.
+        tax = 0.0
+        if traded and traded_shares < 0:
+            pp = purchase_prices.get(ticker)
+            if pp and price > 0:
+                realised_gain = abs(traded_shares) * (price - float(pp))
+                tax = tax_rate_for(asset_types.get(ticker)) * max(realised_gain, 0.0)
+                total_tax += tax
+
+        if within_tol:
+            action = _HOLD_TOLERANCE
+        elif traded_shares > (0 if allow_fractional else 0.0) and traded:
+            action = "BUY"
+        elif traded_shares < 0 and traded:
+            action = "SELL"
+        else:
+            action = "HOLD"
+
+        rows.append({
+            "Ticker": ticker,
+            "Current %": round(cur_w * 100, 2),
+            "Target %": round(tgt_w * 100, 2),
+            "Δ Weight %": round(delta_w * 100, 2),
+            "Price": round(price, 2) if price > 0 else None,
+            "Shares to trade": (
+                int(traded_shares) if (not allow_fractional and price > 0)
+                else (round(traded_shares, 4) if price > 0 else None)),
+            "Trade Value": round(executed_value, 2) if price > 0 else None,
+            "Cap-Gains Tax": round(tax, 2),
+            "Action": action,
+        })
 
     table = pd.DataFrame(rows)
 
     deployed = sum(new_values.values())
     residual_cash = max(investable_capital - deployed, 0.0)
     total_fees = transaction_cost * num_trades
+    total_friction = total_fees + total_tax
 
     achieved_weights = {
         t: (v / deployed) for t, v in new_values.items() if deployed > 0 and v > 0
     }
-
     if mu is not None and achieved_weights:
         gross_return = float(sum(
-            w * float(mu.get(t, 0.0)) for t, w in achieved_weights.items()
-        ))
+            w * float(mu.get(t, 0.0)) for t, w in achieved_weights.items()))
     else:
         gross_return = float("nan")
 
-    fee_drag = (total_fees / investable_capital) if investable_capital > 0 else 0.0
-    net_return = gross_return - fee_drag if not math.isnan(gross_return) else float("nan")
+    friction_drag = (total_friction / investable_capital) if investable_capital > 0 else 0.0
+    net_return = gross_return - friction_drag if not math.isnan(gross_return) else float("nan")
 
     return ReallocationResult(
         table=table,
         achieved_weights=achieved_weights,
         residual_cash=residual_cash,
         total_fees=total_fees,
+        total_tax=total_tax,
+        total_friction=total_friction,
         num_trades=num_trades,
         gross_return=gross_return,
         net_return=net_return,
         allow_fractional=allow_fractional,
         transaction_cost=transaction_cost,
+        tolerance=tolerance,
         investable_capital=investable_capital,
     )
 
 
-def _action_label(delta_value: float, tol: float = 1e-2) -> str:
-    if delta_value > tol:
-        return "Buy"
-    if delta_value < -tol:
-        return "Sell"
-    return "Hold"
+# --------------------------------------------------------------------------- #
+# Tactical liquidity deployment (lump sum vs DCA tranches)
+# --------------------------------------------------------------------------- #
+@dataclass
+class DeploymentPlan:
+    """Capital split for the current rebalancing step."""
+
+    strategy: str
+    tranches: int
+    current_value: float
+    additional_cash: float
+    total_wealth: float       # current portfolio value + ALL additional cash
+    active_capital: float     # capital deployed in THIS step
+    sidelined_cash: float     # cash buffered for future tranches
+    per_tranche_cash: float
+
+
+def deployment_plan(
+    current_value: float,
+    additional_cash: float,
+    strategy: str,
+    tranches: int = 1,
+) -> DeploymentPlan:
+    """Compute the active vs sidelined capital for a deployment strategy.
+
+    *Lump sum* deploys ``current_value + additional_cash`` now. *Tranches/DCA*
+    deploys ``current_value + additional_cash / tranches`` now and sidelines the
+    rest for future periods.
+    """
+    current_value = max(float(current_value), 0.0)
+    additional_cash = max(float(additional_cash), 0.0)
+    total_wealth = current_value + additional_cash
+    is_tranche = ("tranche" in strategy.lower()) or ("dca" in strategy.lower())
+
+    if is_tranche and tranches > 1:
+        per_tranche = additional_cash / tranches
+        active_capital = current_value + per_tranche
+        sidelined = additional_cash - per_tranche
+    else:
+        tranches = 1
+        per_tranche = additional_cash
+        active_capital = total_wealth
+        sidelined = 0.0
+
+    return DeploymentPlan(
+        strategy=strategy,
+        tranches=tranches,
+        current_value=current_value,
+        additional_cash=additional_cash,
+        total_wealth=total_wealth,
+        active_capital=active_capital,
+        sidelined_cash=sidelined,
+        per_tranche_cash=per_tranche,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Behavioral volatility noise classifier
+# --------------------------------------------------------------------------- #
+@dataclass
+class AssetNoise:
+    """Per-asset drawdown classified against its annualised volatility."""
+
+    ticker: str
+    pnl_pct: float
+    annual_vol: float
+    within_1sigma: bool
+
+
+@dataclass
+class NoiseReport:
+    """Portfolio-level behavioral classification of current P/L vs volatility."""
+
+    assets: list[AssetNoise]
+    portfolio_pnl_pct: float
+    portfolio_vol: float
+    portfolio_within_1sigma: bool
+    verdict: str            # "normale" | "grave" | "n/a"
+    commentary: str
+    has_data: bool
+
+
+def classify_noise(current: "CurrentPortfolio", cov: pd.DataFrame) -> NoiseReport:
+    """Classify each asset's P/L drawdown against its annualised volatility (σ).
+
+    Moves within ±1σ are flagged as expected "market noise"; moves beyond ±1σ as
+    statistical outliers. A portfolio-level verdict ("normale"/"grave") supports
+    behavioural discipline. Degrades gracefully when no purchase prices exist.
+    """
+    if current is None or not current.has_cost_data:
+        return NoiseReport(
+            assets=[], portfolio_pnl_pct=float("nan"), portfolio_vol=float("nan"),
+            portfolio_within_1sigma=True, verdict="n/a",
+            commentary=("Add purchase prices to enable the behavioral volatility "
+                        "classifier and P/L drawdown analysis."),
+            has_data=False,
+        )
+
+    assets: list[AssetNoise] = []
+    for ticker, cost in current.cost_basis.items():
+        if cost <= 0:
+            continue
+        pnl_pct = current.unrealized_pnl[ticker] / cost
+        annual_vol = float(np.sqrt(cov.loc[ticker, ticker])) if ticker in cov.index \
+            else float("nan")
+        within = (not np.isnan(annual_vol)) and abs(pnl_pct) <= annual_vol
+        assets.append(AssetNoise(ticker, pnl_pct, annual_vol, within))
+
+    port_pnl_pct = current.total_pnl / current.total_cost if current.total_cost > 0 else 0.0
+    port_vol = float(current.volatility)
+    within_port = abs(port_pnl_pct) <= port_vol if port_vol > 0 else True
+
+    if within_port or port_pnl_pct >= 0:
+        verdict = "normale"
+        commentary = (
+            "🟢 **Normale.** The portfolio's current swing is within ±1σ of its "
+            f"annualised volatility ({port_vol * 100:.1f}%). This is standard "
+            "market fluctuation — statistically expected noise, not a structural "
+            "break. Stay disciplined and avoid emotional, fee-incurring trades."
+        )
+    else:
+        verdict = "grave"
+        commentary = (
+            "🔴 **Grave.** The drawdown exceeds the portfolio's annualised "
+            f"volatility ({port_vol * 100:.1f}%), i.e. beyond 1σ. This may signal "
+            "a structural covariance break rather than normal noise — a deliberate "
+            "portfolio review (not panic selling) is warranted."
+        )
+
+    return NoiseReport(
+        assets=assets, portfolio_pnl_pct=port_pnl_pct, portfolio_vol=port_vol,
+        portfolio_within_1sigma=within_port, verdict=verdict,
+        commentary=commentary, has_data=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Institutional execution export (IBKR TWS Basket Trader + config sheet)
+# --------------------------------------------------------------------------- #
+def clean_ib_symbol(ticker: str) -> str:
+    """Strip the Yahoo exchange suffix (``.DE``/``.MI`` …) for IB compatibility."""
+    return str(ticker).upper().split(".")[0]
+
+
+def basket_trader_csv(realloc: ReallocationResult) -> str:
+    """Render the reallocation plan as an IBKR TWS Basket Trader CSV string.
+
+    Columns are exactly ``Action, Quantity, Symbol, OrderType`` (MKT). Only
+    whole-share, non-zero trades are exported; within-tolerance holds are skipped.
+    """
+    rows = []
+    for _, row in realloc.table.iterrows():
+        shares = row.get("Shares to trade")
+        if shares is None or (isinstance(shares, float) and math.isnan(shares)):
+            continue
+        qty = int(round(abs(float(shares))))
+        if qty <= 0:
+            continue
+        action = "BUY" if float(shares) > 0 else "SELL"
+        rows.append({
+            "Action": action,
+            "Quantity": qty,
+            "Symbol": clean_ib_symbol(row["Ticker"]),
+            "OrderType": "MKT",
+        })
+    frame = pd.DataFrame(rows, columns=["Action", "Quantity", "Symbol", "OrderType"])
+    return frame.to_csv(index=False)
+
+
+def portfolio_config_csv(
+    current_values: dict[str, float],
+    target_weights: dict[str, float],
+    investable_capital: float,
+    sector_map: dict[str, str] | None = None,
+    base_currency: str = "USD",
+) -> str:
+    """Render a current-vs-target configuration sheet (weights, values, sectors)."""
+    sector_map = sector_map or {}
+    total_current = sum(current_values.values()) or 1.0
+    tickers = sorted(set(current_values) | set(target_weights))
+    rows = []
+    for ticker in tickers:
+        cur_val = float(current_values.get(ticker, 0.0))
+        tgt_w = float(target_weights.get(ticker, 0.0))
+        rows.append({
+            "Ticker": ticker,
+            "Sector": sector_map.get(ticker, UNKNOWN_SECTOR),
+            "Current Weight %": round(cur_val / total_current * 100, 2),
+            "Target Weight %": round(tgt_w * 100, 2),
+            f"Current Value ({base_currency})": round(cur_val, 2),
+            f"Target Value ({base_currency})": round(tgt_w * investable_capital, 2),
+        })
+    return pd.DataFrame(rows).to_csv(index=False)

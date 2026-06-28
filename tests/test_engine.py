@@ -15,18 +15,27 @@ import pandas as pd
 import pytest
 
 from src import optimizer
-from src.data_loader import PriceDataError
+from src.data_loader import PriceDataError, convert_to_base_currency
 from src.optimizer import (
     AnchorConstraint,
+    backtest_equity_curves,
     benchmark_point,
     black_litterman_implied_returns,
     screen_watchlist,
+    simulate_gbm_wealth,
 )
 from src.portfolio import (
+    basket_trader_csv,
     build_current_portfolio,
+    classify_noise,
+    clean_ib_symbol,
+    deployment_plan,
+    guess_asset_type,
     parse_ibkr_positions,
+    portfolio_config_csv,
     reallocation_plan,
 )
+from src.sample_data import generate_sample_prices
 
 
 def _synthetic_prices(n_days: int = 1000, seed: int = 3) -> pd.DataFrame:
@@ -363,3 +372,181 @@ def test_screen_watchlist_skips_unknown_and_duplicates(prices):
     # "AAA" already in base, "ZZZ" not in the price panel -> both skipped.
     base_sharpe, recs = screen_watchlist(prices, base, ["AAA", "ZZZ", "CCC"], 0.02)
     assert [r.ticker for r in recs] == ["CCC"]
+
+
+# --------------------------------------------------------------------------- #
+# Sector concentration guardrails
+# --------------------------------------------------------------------------- #
+def test_sector_cap_is_enforced(inputs):
+    mu, cov = inputs
+    sector_map = {"AAA": "Tech", "BBB": "Tech", "CCC": "Bond"}
+    tan = optimizer.max_sharpe_portfolio(mu, cov, 0.02, sector_map=sector_map, sector_max=0.6)
+    assert tan is not None
+    tech = tan.weights["AAA"] + tan.weights["BBB"]
+    assert tech <= 0.6 + 1e-4
+
+
+def test_unknown_sector_is_unconstrained(inputs):
+    mu, cov = inputs
+    # All 'Unknown' -> no sector constraint added, weights still sum to one.
+    sector_map = {"AAA": "Unknown", "BBB": "Unknown", "CCC": "Unknown"}
+    mvp = optimizer.min_variance_portfolio(mu, cov, 0.02, sector_map=sector_map, sector_max=0.1)
+    assert abs(sum(mvp.weights.values()) - 1.0) < 1e-4
+
+
+# --------------------------------------------------------------------------- #
+# GBM Monte-Carlo wealth projection
+# --------------------------------------------------------------------------- #
+def test_gbm_percentiles_ordered_and_contributions():
+    proj = simulate_gbm_wealth(10_000, mu=0.07, sigma=0.15, horizon_years=10,
+                               monthly_contribution=100, n_paths=4000, seed=1)
+    assert len(proj.times_years) == 10 * 12 + 1
+    assert proj.final_p10 <= proj.final_p50 <= proj.final_p90
+    assert proj.total_contributed == pytest.approx(10_000 + 100 * 120)
+    # Zero volatility -> deterministic compounding (all percentiles equal).
+    det = simulate_gbm_wealth(1000, mu=0.05, sigma=0.0, horizon_years=5,
+                              n_paths=500, seed=2)
+    assert det.final_p10 == pytest.approx(det.final_p90, rel=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# Historical backtest
+# --------------------------------------------------------------------------- #
+def test_backtest_curves_and_diagnostics(prices):
+    weight_sets = {"Single": {"AAA": 1.0},
+                   "Equal": {"AAA": 1 / 3, "BBB": 1 / 3, "CCC": 1 / 3}}
+    bt = backtest_equity_curves(prices, weight_sets, 0.02,
+                                benchmark_prices=prices["CCC"], benchmark_name="CCC")
+    assert set(bt.curves.columns) == {"Single", "Equal", "CCC"}
+    assert set(bt.diagnostics.columns) == {
+        "Cumulative Return %", "Annualised Sharpe", "Max Drawdown %"}
+    # A 100% AAA portfolio must match AAA's own total return.
+    aaa_total = prices["AAA"].iloc[-1] / prices["AAA"].iloc[0] - 1
+    assert bt.diagnostics.loc["Single", "Cumulative Return %"] == pytest.approx(
+        aaa_total * 100, abs=1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Deployment plan (lump sum vs tranches)
+# --------------------------------------------------------------------------- #
+def test_deployment_lump_sum():
+    dp = deployment_plan(10_000, 12_000, "Lump Sum (Deploy All Now)")
+    assert dp.active_capital == pytest.approx(22_000)
+    assert dp.sidelined_cash == pytest.approx(0.0)
+    assert dp.total_wealth == pytest.approx(22_000)
+
+
+def test_deployment_tranches():
+    dp = deployment_plan(10_000, 12_000, "Tranches / DCA (Gradual Deployment)", tranches=4)
+    assert dp.per_tranche_cash == pytest.approx(3_000)
+    assert dp.active_capital == pytest.approx(13_000)
+    assert dp.sidelined_cash == pytest.approx(9_000)
+
+
+# --------------------------------------------------------------------------- #
+# Rebalancing tolerance + Italian tax
+# --------------------------------------------------------------------------- #
+def test_tolerance_flags_hold(prices, inputs):
+    mu, _ = inputs
+    latest = pd.Series({"AAA": 100.0, "BBB": 100.0})
+    current_values = {"AAA": 5_000.0, "BBB": 5_000.0}
+    target = {"AAA": 0.51, "BBB": 0.49}  # ±1% drift, below a 3% tolerance
+    res = reallocation_plan(current_values, target, 10_000.0, latest, mu=mu,
+                            tolerance=0.03)
+    assert res.num_trades == 0
+    assert list(res.table["Action"]) == ["HOLD / Within Tolerance"] * 2
+
+
+def test_italian_capital_gains_tax_on_sale(inputs):
+    mu, _ = inputs
+    latest = pd.Series({"AAA": 100.0, "BBB": 100.0})
+    current_values = {"AAA": 6_000.0, "BBB": 4_000.0}
+    target = {"AAA": 0.30, "BBB": 0.70}     # sell AAA, buy BBB
+    res = reallocation_plan(
+        current_values, target, 10_000.0, latest, mu=mu, tolerance=0.0,
+        purchase_prices={"AAA": 50.0}, asset_types={"AAA": "Stock/ETF"})
+    # Sell 30 shares of AAA at 100 bought at 50 -> gain 1500 -> tax 26% = 390.
+    assert res.total_tax == pytest.approx(390.0, abs=1e-6)
+    assert res.net_return <= res.gross_return
+
+
+def test_bond_tax_rate_is_lower(inputs):
+    mu, _ = inputs
+    latest = pd.Series({"AAA": 100.0, "BBB": 100.0})
+    res = reallocation_plan(
+        {"AAA": 6_000.0, "BBB": 4_000.0}, {"AAA": 0.30, "BBB": 0.70}, 10_000.0,
+        latest, mu=mu, purchase_prices={"AAA": 50.0},
+        asset_types={"AAA": "Bond/Fixed Income"})
+    assert res.total_tax == pytest.approx(0.125 * 1500.0)  # 12.5% white-list rate
+
+
+# --------------------------------------------------------------------------- #
+# Behavioral noise classifier
+# --------------------------------------------------------------------------- #
+def test_noise_classifier_with_and_without_costs(prices, inputs):
+    mu, cov = inputs
+    latest = prices.iloc[-1]
+    cur = build_current_portfolio({"AAA": 10, "BBB": 5}, latest, mu, cov, 0.02,
+                                  purchase_prices={"AAA": float(latest["AAA"]) * 0.9,
+                                                   "BBB": float(latest["BBB"]) * 1.5})
+    report = classify_noise(cur, cov)
+    assert report.has_data and report.verdict in {"normale", "grave"}
+    flags = {a.ticker: a.within_1sigma for a in report.assets}
+    assert set(flags) == {"AAA", "BBB"}
+
+    no_cost = build_current_portfolio({"AAA": 10}, latest, mu, cov, 0.02)
+    assert classify_noise(no_cost, cov).has_data is False
+
+
+# --------------------------------------------------------------------------- #
+# Currency normalisation
+# --------------------------------------------------------------------------- #
+def test_convert_to_base_currency():
+    idx = pd.bdate_range("2022-01-01", periods=4)
+    prices = pd.DataFrame({"US": [100, 101, 102, 103], "EU": [10, 11, 12, 13]}, index=idx)
+    fx = pd.Series([1.1, 1.1, 1.1, 1.1], index=idx)  # USD per 1 EUR
+    out = convert_to_base_currency(prices, {"US": "USD", "EU": "EUR"}, "USD", {"EUR": fx})
+    assert list(out["US"]) == [100, 101, 102, 103]          # base unchanged
+    assert out["EU"].tolist() == pytest.approx([11.0, 12.1, 13.2, 14.3])
+
+
+def test_sample_currency_conversion_scales_foreign_assets():
+    eur = generate_sample_prices(["AAPL", "VWCE.DE"], lookback_years=2, base_currency="EUR")
+    assert eur.base_currency == "EUR"
+    assert all(c == "EUR" for c in eur.currencies.values())
+
+
+# --------------------------------------------------------------------------- #
+# Execution exports & asset typing
+# --------------------------------------------------------------------------- #
+def test_basket_trader_csv_format(inputs):
+    mu, _ = inputs
+    latest = pd.Series({"AAA": 100.0, "VWCE.DE": 100.0})
+    res = reallocation_plan({"AAA": 6_000.0}, {"AAA": 0.3, "VWCE.DE": 0.7}, 10_000.0,
+                            latest, mu=mu, allow_fractional=False)
+    csv_text = basket_trader_csv(res)
+    header = csv_text.splitlines()[0]
+    assert header == "Action,Quantity,Symbol,OrderType"
+    assert "VWCE," in csv_text          # .DE suffix stripped
+    assert "SELL" in csv_text and "BUY" in csv_text
+
+
+def test_clean_ib_symbol():
+    assert clean_ib_symbol("VWCE.DE") == "VWCE"
+    assert clean_ib_symbol("AGGH.MI") == "AGGH"
+    assert clean_ib_symbol("AAPL") == "AAPL"
+
+
+def test_portfolio_config_csv_columns():
+    csv_text = portfolio_config_csv({"AAA": 5_000.0}, {"AAA": 0.4, "BBB": 0.6}, 10_000.0,
+                                    {"AAA": "Tech", "BBB": "Bond"}, "EUR")
+    header = csv_text.splitlines()[0]
+    assert "Current Weight %" in header and "Target Weight %" in header
+    assert "Sector" in header and "(EUR)" in header
+
+
+def test_guess_asset_type():
+    assert guess_asset_type("AGGH.MI") == "Bond/Fixed Income"
+    assert guess_asset_type("TLT") == "Bond/Fixed Income"
+    assert guess_asset_type("AAPL") == "Stock/ETF"
+    assert guess_asset_type("VWCE.DE") == "Stock/ETF"

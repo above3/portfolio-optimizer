@@ -36,6 +36,16 @@ Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 | **Hybrid holdings table** (IBKR + manual + purchase price / P&L) | `app.py` + `portfolio` |
 | **Core global anchor** (VWCE.DE fixed/capped weight) | `optimizer.AnchorConstraint` |
 | **Watchlist diversification scanner** | `optimizer.screen_watchlist` |
+| **Asset typing** (Stock/ETF vs Bond/Fixed Income) | `portfolio.guess_asset_type` |
+| **Currency normalisation** (EUR/USD via live FX) | `data_loader.convert_to_base_currency` |
+| **Sector concentration guardrails** | `optimizer` (`add_sector_constraints`) |
+| **Lump-sum vs DCA-tranche deployment** | `portfolio.deployment_plan` |
+| **Rebalancing tolerance bands** | `portfolio.reallocation_plan` |
+| **Italian capital-gains tax engine** (26% / 12.5%) | `portfolio.reallocation_plan` |
+| **Behavioral volatility noise classifier** | `portfolio.classify_noise` |
+| **Historical backtesting** (equity curves + Max DD) | `optimizer.backtest_equity_curves` |
+| **GBM Monte-Carlo wealth projection** (fan chart) | `optimizer.simulate_gbm_wealth` |
+| **IBKR TWS Basket-Trader export** | `portfolio.basket_trader_csv` |
 
 The chart shows the feasible-set cloud coloured by Sharpe ratio, the efficient
 frontier, the CML, the risk-free point, and star/diamond markers for the MVP,

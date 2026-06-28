@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import plotly.graph_objects as go
 
-from .optimizer import FrontierResult, PortfolioPoint
+from .optimizer import BacktestResult, FrontierResult, PortfolioPoint, WealthProjection
 from .portfolio import CurrentPortfolio
 
 
@@ -217,5 +217,69 @@ def correlation_heatmap(corr) -> go.Figure:
         template="plotly_white",
         height=460,
         yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+_BACKTEST_COLORS = ["#9467bd", "#d62728", "#FFD700", "#1f77b4", "#2ca02c"]
+
+
+def backtest_figure(backtest: BacktestResult) -> go.Figure:
+    """Normalised (base-100) equity curves for the competing allocations."""
+    fig = go.Figure()
+    for i, col in enumerate(backtest.curves.columns):
+        curve = backtest.curves[col].dropna()
+        diag = backtest.diagnostics.loc[col]
+        fig.add_trace(go.Scatter(
+            x=curve.index, y=curve.values, mode="lines", name=col,
+            line=dict(color=_BACKTEST_COLORS[i % len(_BACKTEST_COLORS)], width=2.5),
+            hovertemplate=(f"<b>{col}</b><br>%{{x|%Y-%m-%d}}<br>Value: %{{y:.1f}}<br>"
+                           f"Cum: {diag['Cumulative Return %']}% · "
+                           f"Sharpe: {diag['Annualised Sharpe']} · "
+                           f"MaxDD: {diag['Max Drawdown %']}%<extra></extra>"),
+        ))
+    fig.add_hline(y=100, line=dict(color="gray", width=1, dash="dot"))
+    fig.update_layout(
+        title="Historical Backtest — Growth of a 100 base",
+        xaxis_title="Date", yaxis_title="Portfolio value (base = 100)",
+        template="plotly_white", height=520, hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
+def gbm_fan_chart(projection: WealthProjection, currency_symbol: str = "$") -> go.Figure:
+    """Probability fan chart (10th/50th/90th percentile cone) of future wealth."""
+    t = projection.times_years
+    fig = go.Figure()
+    # Upper bound (90th) then lower bound (10th) with fill between them.
+    fig.add_trace(go.Scatter(
+        x=t, y=projection.p90, mode="lines", name="90th pct (optimistic)",
+        line=dict(width=0), hoverinfo="skip", showlegend=True))
+    fig.add_trace(go.Scatter(
+        x=t, y=projection.p10, mode="lines", name="10th pct (pessimistic)",
+        line=dict(width=0), fill="tonexty", fillcolor="rgba(31,119,180,0.20)",
+        hoverinfo="skip", showlegend=True))
+    fig.add_trace(go.Scatter(
+        x=t, y=projection.p50, mode="lines", name="Median (expected)",
+        line=dict(color="#1f77b4", width=3),
+        hovertemplate=(f"Year %{{x:.1f}}<br>Median: {currency_symbol}%{{y:,.0f}}"
+                       "<extra></extra>")))
+    fig.add_trace(go.Scatter(
+        x=t, y=projection.p90, mode="lines", name="",
+        line=dict(color="#2ca02c", width=1, dash="dot"), showlegend=False,
+        hovertemplate=f"P90: {currency_symbol}%{{y:,.0f}}<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=t, y=projection.p10, mode="lines", name="",
+        line=dict(color="#d62728", width=1, dash="dot"), showlegend=False,
+        hovertemplate=f"P10: {currency_symbol}%{{y:,.0f}}<extra></extra>"))
+    fig.update_layout(
+        title=(f"GBM Wealth Projection · {projection.horizon_years:.0f}y · "
+               f"μ={projection.mu * 100:.1f}% σ={projection.sigma * 100:.1f}% · "
+               f"{projection.n_paths:,} paths"),
+        xaxis_title="Years from today",
+        yaxis_title=f"Projected wealth ({currency_symbol})",
+        template="plotly_white", height=520, hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     return fig

@@ -22,8 +22,68 @@ from io import StringIO
 import numpy as np
 import pandas as pd
 
-from .config import DEFAULT_LOOKBACK_YEARS, TRADING_DAYS_PER_YEAR
+from .config import DEFAULT_LOOKBACK_YEARS, TRADING_DAYS_PER_YEAR, UNKNOWN_SECTOR
 from .data_loader import PriceData, PriceDataError
+
+# Human-readable sector labels for the internal factor-model sector codes.
+_SECTOR_LABELS: dict[str, str] = {
+    "tech": "Technology",
+    "health": "Healthcare",
+    "financial": "Financial Services",
+    "energy": "Energy",
+    "consumer": "Consumer Defensive",
+    "auto": "Automotive",
+    "market": "Diversified ETF",
+    "bond": "Fixed Income",
+    "gold": "Commodities",
+}
+
+# Native currency inferred from the Yahoo exchange suffix (offline heuristic).
+_SUFFIX_CURRENCY: dict[str, str] = {
+    ".DE": "EUR", ".MI": "EUR", ".AS": "EUR", ".PA": "EUR", ".BD": "EUR",
+    ".L": "GBP", ".SW": "CHF", ".TO": "CAD", ".T": "JPY", ".HK": "HKD",
+}
+
+# Deterministic synthetic FX factors (base per 1 unit of source) for the
+# offline path, so currency normalisation can be demonstrated without network.
+_SYNTH_FX: dict[tuple[str, str], float] = {
+    ("USD", "EUR"): 0.92, ("EUR", "USD"): 1.087,
+    ("GBP", "USD"): 1.27, ("USD", "GBP"): 0.787,
+    ("GBP", "EUR"): 1.17, ("EUR", "GBP"): 0.855,
+    ("CHF", "USD"): 1.12, ("USD", "CHF"): 0.893,
+    ("CHF", "EUR"): 1.03, ("EUR", "CHF"): 0.971,
+}
+
+
+def _native_currency(ticker: str) -> str:
+    """Infer an asset's native currency from its Yahoo exchange suffix."""
+    upper = ticker.upper()
+    for suffix, ccy in _SUFFIX_CURRENCY.items():
+        if upper.endswith(suffix):
+            return ccy
+    return "USD"
+
+
+def _synthetic_fx_factor(from_ccy: str, to_ccy: str) -> float:
+    """Constant offline FX factor (``to_ccy`` per 1 ``from_ccy``)."""
+    if from_ccy == to_ccy:
+        return 1.0
+    return _SYNTH_FX.get((from_ccy, to_ccy), 1.0)
+
+
+def sample_metadata(tickers, base_currency: str | None = None) -> dict[str, dict[str, str]]:
+    """Offline ``{ticker: {"currency", "sector"}}`` mirroring fetch_asset_metadata."""
+    meta: dict[str, dict[str, str]] = {}
+    for raw in tickers:
+        ticker = str(raw).strip().upper()
+        if not ticker:
+            continue
+        _, _, sector_code = _profile_for(ticker)
+        meta[ticker] = {
+            "currency": base_currency.upper() if base_currency else _native_currency(ticker),
+            "sector": _SECTOR_LABELS.get(sector_code, UNKNOWN_SECTOR),
+        }
+    return meta
 
 # (annual_return, annual_volatility, sector) for a set of well-known tickers.
 _KNOWN_PROFILES: dict[str, tuple[float, float, str]] = {
@@ -85,12 +145,15 @@ def generate_sample_prices(
     end: dt.date | None = None,
     seed: int = 27,
     benchmark: str | None = None,
+    base_currency: str | None = None,
 ) -> PriceData:
     """Synthesise a correlated daily close-price panel for ``tickers``.
 
     The output mirrors :class:`~src.data_loader.PriceData` so it is a drop-in
     replacement for the live download path. When ``benchmark`` is supplied it is
-    generated with the same factor model and returned separately.
+    generated with the same factor model and returned separately. When
+    ``base_currency`` is given, foreign-currency assets are scaled by a constant
+    synthetic FX factor so the normalisation pipeline is exercised offline.
     """
     symbols = [str(t).strip().upper() for t in tickers if str(t).strip()]
     symbols = list(dict.fromkeys(symbols))  # de-dupe, preserve order
@@ -129,8 +192,23 @@ def generate_sample_prices(
         columns[symbol] = 100.0 * np.exp(np.cumsum(log_rets))
 
     panel = pd.DataFrame(columns, index=dates)
+
+    # ---- Metadata + offline currency normalisation ----
+    meta = sample_metadata(all_symbols)
+    native_ccy = {t: meta[t]["currency"] for t in all_symbols}
+    base = base_currency.upper() if base_currency else None
+    if base:
+        for symbol in all_symbols:
+            factor = _synthetic_fx_factor(native_ccy[symbol], base)
+            if factor != 1.0:
+                panel[symbol] = panel[symbol] * factor
+        currencies = {t: base for t in symbols}
+    else:
+        currencies = {t: native_ccy[t] for t in symbols}
+
     prices = panel[symbols]
     benchmark_prices = panel[bench] if bench else None
+    sectors = {t: meta[t]["sector"] for t in symbols}
 
     return PriceData(
         prices=prices,
@@ -141,10 +219,15 @@ def generate_sample_prices(
         end=prices.index[-1].date(),
         benchmark_ticker=bench,
         benchmark_prices=benchmark_prices,
+        currencies=currencies,
+        sectors=sectors,
+        base_currency=base_currency,
+        notes=[],
     )
 
 
-def load_prices_from_csv(file, tickers=None, benchmark: str | None = None) -> PriceData:
+def load_prices_from_csv(file, tickers=None, benchmark: str | None = None,
+                         base_currency: str | None = None) -> PriceData:
     """Load a close-price panel from an uploaded CSV.
 
     The CSV must have a date column (first column or named ``Date``) and one
@@ -199,6 +282,9 @@ def load_prices_from_csv(file, tickers=None, benchmark: str | None = None) -> Pr
             "least one fully-populated price column)."
         )
 
+    # CSV prices are assumed already in the base currency; sectors are inferred
+    # from the offline metadata heuristic so the guardrails still function.
+    asset_meta = sample_metadata(list(prices.columns), base_currency=base_currency)
     return PriceData(
         prices=prices,
         latest_prices=prices.iloc[-1],
@@ -208,4 +294,9 @@ def load_prices_from_csv(file, tickers=None, benchmark: str | None = None) -> Pr
         end=prices.index[-1].date(),
         benchmark_ticker=bench if benchmark_prices is not None else None,
         benchmark_prices=benchmark_prices,
+        currencies={t: (base_currency or asset_meta[t]["currency"])
+                    for t in prices.columns},
+        sectors={t: asset_meta[t]["sector"] for t in prices.columns},
+        base_currency=base_currency,
+        notes=[],
     )
