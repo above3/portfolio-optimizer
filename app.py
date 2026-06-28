@@ -33,10 +33,12 @@ from src.optimizer import (
 from src.portfolio import (
     CurrentPortfolio,
     NoiseReport,
+    PortfolioStore,
     basket_trader_csv,
     build_current_portfolio,
     classify_noise,
     deployment_plan,
+    normalise_holdings_df,
     parse_ibkr_positions,
     portfolio_config_csv,
     reallocation_plan,
@@ -53,7 +55,44 @@ st.set_page_config(page_title="Portfolio Optimizer · MPT", page_icon="📈", la
 
 
 # --------------------------------------------------------------------------- #
-# Formatting helpers
+# Premium institutional dark-mode theme (CSS injection)
+# --------------------------------------------------------------------------- #
+_DARK_CSS = """
+<style>
+:root { --pc-bg:#0e1117; --pc-card:#1a1d24; --pc-border:#2a2e39;
+        --pc-text:#e6e9ef; --pc-muted:#8b95a5; --pc-green:#2ecc71; --pc-red:#e74c3c; }
+.stApp { background-color: var(--pc-bg); color: var(--pc-text); }
+section[data-testid="stSidebar"] { background-color: #14171d; border-right: 1px solid var(--pc-border); }
+h1, h2, h3 { color: var(--pc-text); letter-spacing: .2px; }
+/* Native metric cards */
+div[data-testid="stMetric"] {
+    background: var(--pc-card); border: 1px solid var(--pc-border);
+    border-radius: 12px; padding: 14px 16px; }
+div[data-testid="stMetricValue"] { font-weight: 700; }
+/* Custom financial cards */
+.pc-card { background: var(--pc-card); border: 1px solid var(--pc-border);
+    border-radius: 14px; padding: 16px 18px; margin-bottom: 10px; }
+.pc-card .pc-label { color: var(--pc-muted); font-size: .72rem; letter-spacing: .09em;
+    text-transform: uppercase; margin-bottom: 6px; }
+.pc-card .pc-value { font-size: 1.55rem; font-weight: 700; color: var(--pc-text); line-height: 1.15; }
+.pc-card .pc-sub { font-size: .82rem; margin-top: 4px; color: var(--pc-muted); }
+.pc-card.pc-pos { border-left: 4px solid var(--pc-green); box-shadow: 0 0 18px rgba(46,204,113,.10); }
+.pc-card.pc-pos .pc-value { color: var(--pc-green); }
+.pc-card.pc-neg { border-left: 4px solid var(--pc-red); box-shadow: 0 0 18px rgba(231,76,60,.10); }
+.pc-card.pc-neg .pc-value { color: var(--pc-red); }
+.stButton>button, .stDownloadButton>button { border-radius: 10px; border: 1px solid var(--pc-border); font-weight: 600; }
+.stTabs [data-baseweb="tab-list"] { gap: 4px; }
+.stTabs [data-baseweb="tab"] { background: var(--pc-card); border-radius: 8px 8px 0 0; }
+</style>
+"""
+
+
+def _inject_theme() -> None:
+    st.markdown(_DARK_CSS, unsafe_allow_html=True)
+
+
+# --------------------------------------------------------------------------- #
+# Formatting helpers & custom metric cards
 # --------------------------------------------------------------------------- #
 def _sym(currency: str | None) -> str:
     return config.CURRENCY_SYMBOLS.get((currency or "USD").upper(), "$")
@@ -61,6 +100,108 @@ def _sym(currency: str | None) -> str:
 
 def _money(value: float, currency: str | None) -> str:
     return f"{_sym(currency)}{value:,.0f}"
+
+
+def _card(label: str, value: str, sub: str = "", tone: str = "neutral") -> None:
+    """Render a styled financial metric card (tone: positive/negative/neutral)."""
+    cls = {"positive": "pc-pos", "negative": "pc-neg"}.get(tone, "")
+    sub_html = f'<div class="pc-sub">{sub}</div>' if sub else ""
+    st.markdown(
+        f'<div class="pc-card {cls}"><div class="pc-label">{label}</div>'
+        f'<div class="pc-value">{value}</div>{sub_html}</div>',
+        unsafe_allow_html=True)
+
+
+def _tone_for(value: float) -> str:
+    return "positive" if value >= 0 else "negative"
+
+
+# --------------------------------------------------------------------------- #
+# Optional password gate (Streamlit secrets)
+# --------------------------------------------------------------------------- #
+def _check_password() -> bool:
+    """Optional login gate. Enabled only when ``APP_PASSWORD`` is set in
+    ``.streamlit/secrets.toml`` (or the Community Cloud secrets manager)."""
+    try:
+        expected = st.secrets.get("APP_PASSWORD", None)
+    except Exception:  # noqa: BLE001 - no secrets file present
+        expected = None
+    if not expected:
+        return True  # authentication disabled
+    if st.session_state.get("_authenticated"):
+        return True
+    st.markdown("### 🔒 Protected app")
+    pwd = st.text_input("Password", type="password", key="_pwd_input")
+    if pwd and pwd == expected:
+        st.session_state["_authenticated"] = True
+        return True
+    if pwd:
+        st.error("Incorrect password.")
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# Local persistence: store accessor + settings seeding
+# --------------------------------------------------------------------------- #
+@st.cache_resource(show_spinner=False)
+def _get_store() -> PortfolioStore:
+    return PortfolioStore()
+
+
+_SETTING_DEFAULTS: dict[str, object] = {
+    "pc_currency": config.DEFAULT_BASE_CURRENCY,
+    "pc_data_source": "Yahoo Finance (live)",
+    "pc_rf_live": True,
+    "pc_rf_manual": config.DEFAULT_RISK_FREE_RATE * 100,
+    "pc_benchmark": config.DEFAULT_BENCHMARK,
+    "pc_lookback": config.DEFAULT_LOOKBACK_YEARS,
+    "pc_returns": next(iter(config.RETURNS_MODELS)),
+    "pc_cov": next(iter(config.COVARIANCE_METHODS)),
+    "pc_anchor_pct": config.DEFAULT_ANCHOR_PCT,
+    "pc_anchor_exact": True,
+    "pc_max_weight": int(config.DEFAULT_MAX_WEIGHT * 100),
+    "pc_sector_max": config.DEFAULT_SECTOR_MAX_PCT,
+    "pc_tolerance": config.DEFAULT_TOLERANCE_PCT,
+    "pc_disable_fractional": False,
+    "pc_transaction_cost": config.DEFAULT_TRANSACTION_COST,
+    "pc_capital": 0.0,
+    "pc_deployment": config.DEPLOYMENT_STRATEGIES[0],
+    "pc_tranches": config.DEFAULT_TRANCHES,
+    "pc_horizon": config.DEFAULT_HORIZON_YEARS,
+    "pc_nsim": config.DEFAULT_N_SIMULATIONS,
+    "pc_watchlist": config.DEFAULT_WATCHLIST,
+}
+_SETTING_OPTIONS: dict[str, tuple] = {
+    "pc_currency": tuple(config.BASE_CURRENCIES),
+    "pc_data_source": ("Yahoo Finance (live)", "Sample data (offline)", "Upload CSV"),
+    "pc_lookback": tuple(config.LOOKBACK_CHOICES),
+    "pc_returns": tuple(config.RETURNS_MODELS),
+    "pc_cov": tuple(config.COVARIANCE_METHODS),
+    "pc_deployment": tuple(config.DEPLOYMENT_STRATEGIES),
+}
+
+
+def _seed_settings(store: PortfolioStore) -> None:
+    """Seed widget session_state from the persisted settings (or defaults)."""
+    saved = store.load_settings()
+    saved = saved if isinstance(saved, dict) else {}
+    for key, default in _SETTING_DEFAULTS.items():
+        if key in st.session_state:
+            continue
+        value = saved.get(key, default)
+        options = _SETTING_OPTIONS.get(key)
+        if options is not None and value not in options:
+            value = default
+        st.session_state[key] = value
+
+
+def _persist_state(store: PortfolioStore, holdings: pd.DataFrame) -> None:
+    """Auto-commit holdings + settings to the local DB (best-effort)."""
+    try:
+        store.save_holdings(holdings)
+        store.save_settings({k: st.session_state.get(k) for k in _SETTING_DEFAULTS})
+    except Exception:  # noqa: BLE001 - persistence must never break the UI
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -136,11 +277,16 @@ def _run_watchlist(prices, base_tickers, watchlist_tickers, risk_free_rate, cov_
 # Session state
 # --------------------------------------------------------------------------- #
 def _init_state() -> None:
+    store = _get_store()
     if "holdings_df" not in st.session_state:
-        st.session_state.holdings_df = pd.DataFrame(config.DEMO_PORTFOLIO)
+        loaded = store.load_holdings()
+        st.session_state.holdings_df = (
+            loaded if loaded is not None and not loaded.empty
+            else normalise_holdings_df(pd.DataFrame(config.DEMO_PORTFOLIO)))
     st.session_state.setdefault("editor_version", 0)
     st.session_state.setdefault("ibkr_file_id", None)
     st.session_state.setdefault("auto_run", False)
+    _seed_settings(store)
 
 
 # --------------------------------------------------------------------------- #
@@ -148,7 +294,7 @@ def _init_state() -> None:
 # --------------------------------------------------------------------------- #
 def _risk_free_controls() -> float:
     fetch_live = st.sidebar.toggle(
-        f"Fetch Live Risk-Free Rate ({config.RISK_FREE_TICKER})", value=True,
+        f"Fetch Live Risk-Free Rate ({config.RISK_FREE_TICKER})", key="pc_rf_live",
         help="Use the US 3-Month T-Bill yield as Rf for the tangency portfolio.")
     if fetch_live:
         try:
@@ -157,23 +303,23 @@ def _risk_free_controls() -> float:
             return rf
         except Exception as exc:  # noqa: BLE001 - blocked network/parse error
             st.sidebar.warning(f"Live rate unavailable ({type(exc).__name__}). Enter manually.")
-    rf_pct = st.sidebar.number_input("Risk-free rate Rf (%)", 0.0, 25.0,
-                                     config.DEFAULT_RISK_FREE_RATE * 100, 0.25)
+    rf_pct = st.sidebar.number_input("Risk-free rate Rf (%)", 0.0, 25.0, step=0.25,
+                                     key="pc_rf_manual")
     return rf_pct / 100.0
 
 
 def render_sidebar() -> dict:
     st.sidebar.header("⚙️ Parameters")
+    st.sidebar.caption("💾 Settings & holdings auto-save to a local database.")
 
     base_currency = st.sidebar.selectbox(
-        "Base Display Currency", options=config.BASE_CURRENCIES,
-        index=config.BASE_CURRENCIES.index(config.DEFAULT_BASE_CURRENCY),
+        "Base Display Currency", options=config.BASE_CURRENCIES, key="pc_currency",
         help="All prices, values and P/L are normalised into this currency via "
              "live FX rates (graceful fallback to native currency on failure).")
 
     data_source = st.sidebar.radio(
         "Data source", ["Yahoo Finance (live)", "Sample data (offline)", "Upload CSV"],
-        index=0, help="Live needs Yahoo Finance access; otherwise use offline/CSV.")
+        key="pc_data_source", help="Live needs Yahoo Finance access; otherwise use offline/CSV.")
     uploaded_csv = None
     if data_source == "Upload CSV":
         uploaded_csv = st.sidebar.file_uploader("Close-price CSV", type=["csv"])
@@ -183,55 +329,58 @@ def render_sidebar() -> dict:
 
     st.sidebar.markdown("### 📊 Benchmark & lookback")
     benchmark = st.sidebar.text_input("Market Benchmark Ticker",
-                                      value=config.DEFAULT_BENCHMARK).strip().upper() or None
+                                      key="pc_benchmark").strip().upper() or None
     lookback = st.sidebar.selectbox("Historical lookback (years)", config.LOOKBACK_CHOICES,
-                                    index=config.LOOKBACK_CHOICES.index(config.DEFAULT_LOOKBACK_YEARS))
+                                    key="pc_lookback")
 
     st.sidebar.markdown("### 🧮 Returns & risk model")
     returns_label = st.sidebar.radio("Expected-returns model",
-                                     list(config.RETURNS_MODELS.keys()), index=0)
+                                     list(config.RETURNS_MODELS.keys()), key="pc_returns")
     cov_label = st.sidebar.selectbox("Covariance estimator",
-                                     list(config.COVARIANCE_METHODS.keys()), index=0)
+                                     list(config.COVARIANCE_METHODS.keys()), key="pc_cov")
 
     st.sidebar.markdown("### 🌍 Core global anchor")
     anchor_pct = st.sidebar.slider(
         f"Core Global Anchor Allocation ({config.ANCHOR_TICKER}) %",
-        0, config.ANCHOR_MAX_PCT, config.DEFAULT_ANCHOR_PCT, 1)
-    anchor_exact = st.sidebar.toggle("Strict Target Match (else Upper Cap Bound)", value=True)
+        0, config.ANCHOR_MAX_PCT, step=1, key="pc_anchor_pct")
+    anchor_exact = st.sidebar.toggle("Strict Target Match (else Upper Cap Bound)",
+                                     key="pc_anchor_exact")
 
     st.sidebar.markdown("### 🛡️ Constraints & guardrails")
-    max_weight_pct = st.sidebar.slider("Max Allocation per Asset (%)", 5, 100,
-                                       int(config.DEFAULT_MAX_WEIGHT * 100), 5)
+    max_weight_pct = st.sidebar.slider("Max Allocation per Asset (%)", 5, 100, step=5,
+                                       key="pc_max_weight")
     sector_max_pct = st.sidebar.slider("Max Sector Exposure (%)", config.SECTOR_MIN_PCT,
-                                       config.SECTOR_MAX_PCT, config.DEFAULT_SECTOR_MAX_PCT, 5)
+                                       config.SECTOR_MAX_PCT, step=5, key="pc_sector_max")
     tolerance_pct = st.sidebar.slider("Rebalancing Tolerance Threshold (%)",
                                       config.TOLERANCE_MIN_PCT, config.TOLERANCE_MAX_PCT,
-                                      config.DEFAULT_TOLERANCE_PCT, 1)
+                                      step=1, key="pc_tolerance")
 
     st.sidebar.markdown("### 💸 Friction")
-    disable_fractional = st.sidebar.checkbox("Disable Fractional Shares", value=False)
+    disable_fractional = st.sidebar.checkbox("Disable Fractional Shares",
+                                             key="pc_disable_fractional")
     transaction_cost = st.sidebar.number_input(
         f"Estimated Transaction Cost per Trade ({_sym(base_currency)})",
-        min_value=0.0, value=config.DEFAULT_TRANSACTION_COST, step=0.5)
+        min_value=0.0, step=0.5, key="pc_transaction_cost")
 
     st.sidebar.markdown("### 💰 Capital deployment")
     capital = st.sidebar.number_input(
         f"Additional capital to invest ({_sym(base_currency)})",
-        min_value=0.0, value=0.0, step=1000.0)
+        min_value=0.0, step=1000.0, key="pc_capital")
     deployment_strategy = st.sidebar.selectbox("Capital Deployment Strategy",
-                                               config.DEPLOYMENT_STRATEGIES, index=0)
-    tranches = config.DEFAULT_TRANCHES
+                                               config.DEPLOYMENT_STRATEGIES, key="pc_deployment")
     if "Tranche" in deployment_strategy or "DCA" in deployment_strategy:
         tranches = st.sidebar.slider("Number of Active Tranches (Periods)",
-                                     config.TRANCHE_MIN, config.TRANCHE_MAX,
-                                     config.DEFAULT_TRANCHES, 1)
+                                     config.TRANCHE_MIN, config.TRANCHE_MAX, step=1,
+                                     key="pc_tranches")
+    else:
+        tranches = int(st.session_state.get("pc_tranches", config.DEFAULT_TRANCHES))
 
     st.sidebar.markdown("### 🎲 Projection & simulation")
     horizon_years = st.sidebar.slider("Investment Horizon (Years)",
                                       config.HORIZON_MIN_YEARS, config.HORIZON_MAX_YEARS,
-                                      config.DEFAULT_HORIZON_YEARS, 1)
+                                      step=1, key="pc_horizon")
     n_sim = st.sidebar.slider("Simulated portfolios (Markowitz bullet)",
-                              1000, 20000, config.DEFAULT_N_SIMULATIONS, 1000)
+                              1000, 20000, step=1000, key="pc_nsim")
 
     st.sidebar.markdown("---")
     st.sidebar.caption("Educational tool. Past performance does not guarantee future "
@@ -292,7 +441,7 @@ def render_data_input() -> tuple[pd.DataFrame, list[str]]:
 
     watchlist_raw = st.text_input(
         "🔭 Enter Tickers to screen for Diversification (comma-separated, e.g. GLD, NVDA, LVMH)",
-        value=config.DEFAULT_WATCHLIST)
+        key="pc_watchlist")
     watchlist = [t.strip().upper() for t in watchlist_raw.split(",") if t.strip()]
     return edited, list(dict.fromkeys(watchlist))
 
@@ -329,15 +478,22 @@ def _parse_holdings(edited: pd.DataFrame) -> tuple[dict, dict, dict]:
 def _pnl_ledger(current: CurrentPortfolio | None, symbol_ccy: str) -> None:
     sym = _sym(symbol_ccy)
     c1, c2, c3 = st.columns(3)
+    with c1:
+        _card("Portfolio value",
+              _money(current.total_value, symbol_ccy) if current else "—")
     if current is None or not current.has_cost_data:
-        c1.metric("Portfolio value", _money(current.total_value, symbol_ccy) if current else "—")
-        c2.metric("Unrealised P/L", "n/a")
-        c3.metric("Total return", "n/a")
+        with c2:
+            _card("Unrealised P/L", "n/a", "Add purchase prices to enable")
+        with c3:
+            _card("Total return", "n/a")
         return
     pnl_pct = current.total_pnl / current.total_cost * 100 if current.total_cost > 0 else 0.0
-    c1.metric("Portfolio value", _money(current.total_value, symbol_ccy))
-    c2.metric("Unrealised P/L", f"{sym}{current.total_pnl:,.0f}", delta=f"{pnl_pct:+.1f}%")
-    c3.metric("Invested cost basis", _money(current.total_cost, symbol_ccy))
+    tone = _tone_for(current.total_pnl)
+    with c2:
+        _card("Unrealised P/L", f"{sym}{current.total_pnl:,.0f}",
+              f"{pnl_pct:+.1f}% vs cost basis", tone)
+    with c3:
+        _card("Invested cost basis", _money(current.total_cost, symbol_ccy))
 
 
 def _noise_section(noise: NoiseReport) -> None:
@@ -414,12 +570,16 @@ def _benchmark_banner(result: FrontierResult) -> None:
 
 def _deployment_metrics(deployment, ccy: str) -> None:
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total Capital Wealth Pool", _money(deployment.total_wealth, ccy),
-              help="Current portfolio value + all additional cash.")
-    c2.metric("Deployed in Current Tranche", _money(deployment.active_capital, ccy),
-              help="Capital allocated by the target weights in this step.")
-    c3.metric("Sidelined Cash Reserve", _money(deployment.sidelined_cash, ccy),
-              help="Cash buffered for future DCA tranches.")
+    with c1:
+        _card("Total Capital Wealth Pool", _money(deployment.total_wealth, ccy),
+              "Portfolio value + all additional cash")
+    with c2:
+        _card("Deployed in Current Tranche", _money(deployment.active_capital, ccy),
+              f"{deployment.tranches} tranche(s)")
+    with c3:
+        tone = "positive" if deployment.sidelined_cash > 0 else "neutral"
+        _card("Sidelined Cash Reserve", _money(deployment.sidelined_cash, ccy),
+              "Buffered for future DCA steps", tone)
 
 
 def _render_reallocation(target: PortfolioPoint, current, deployment, latest_prices,
@@ -448,10 +608,13 @@ def _render_reallocation(target: PortfolioPoint, current, deployment, latest_pri
 
         if res.gross_return == res.gross_return:  # not NaN
             g1, g2 = st.columns(2)
-            g1.metric("Gross Optimized Return", f"{res.gross_return * 100:.2f}%")
-            net_delta = (res.net_return - res.gross_return) * 100
-            g2.metric("Net-of-Tax-and-Fees Return", f"{res.net_return * 100:.2f}%",
-                      delta=f"{net_delta:.2f}%" if net_delta else None, delta_color="inverse")
+            with g1:
+                _card("Gross Optimized Return", f"{res.gross_return * 100:.2f}%",
+                      "Before friction", _tone_for(res.gross_return))
+            with g2:
+                friction_pct = (res.net_return - res.gross_return) * 100
+                _card("Net-of-Tax-and-Fees Return", f"{res.net_return * 100:.2f}%",
+                      f"{friction_pct:.2f}% friction drag", _tone_for(res.net_return))
 
         # ---- Institutional execution exports ----
         st.markdown("**📤 Execution export**")
@@ -615,7 +778,12 @@ def render_results(result, current, noise, deployment, data, params,
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    _inject_theme()
+    if not _check_password():
+        return
     _init_state()
+    store = _get_store()
+
     st.title("📈 Portfolio Optimizer — Institutional MPT")
     st.markdown("Hybrid holdings · VWCE core anchor · sector guardrails · currency "
                 "normalisation · DCA tranches · Italian tax · behavioral P&L · "
@@ -623,6 +791,9 @@ def main() -> None:
 
     params = render_sidebar()
     edited, watchlist = render_data_input()
+
+    # Auto-commit holdings + settings to the local DB on every interaction.
+    _persist_state(store, edited)
 
     run = st.button("🔍 Optimize portfolio", type="primary", use_container_width=True)
     auto_run = st.session_state.auto_run

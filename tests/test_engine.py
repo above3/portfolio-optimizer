@@ -25,12 +25,14 @@ from src.optimizer import (
     simulate_gbm_wealth,
 )
 from src.portfolio import (
+    PortfolioStore,
     basket_trader_csv,
     build_current_portfolio,
     classify_noise,
     clean_ib_symbol,
     deployment_plan,
     guess_asset_type,
+    normalise_holdings_df,
     parse_ibkr_positions,
     portfolio_config_csv,
     reallocation_plan,
@@ -550,3 +552,48 @@ def test_guess_asset_type():
     assert guess_asset_type("TLT") == "Bond/Fixed Income"
     assert guess_asset_type("AAPL") == "Stock/ETF"
     assert guess_asset_type("VWCE.DE") == "Stock/ETF"
+
+
+# --------------------------------------------------------------------------- #
+# Local persistence (PortfolioStore)
+# --------------------------------------------------------------------------- #
+def test_store_roundtrip(tmp_path):
+    db = tmp_path / "state.db"
+    store = PortfolioStore(db)
+    holdings = pd.DataFrame({
+        "Ticker": ["AAPL", "VWCE.DE"], "Shares": [10, 5],
+        "Purchase Price": [175.0, None], "Asset Type": ["Stock/ETF", "Stock/ETF"]})
+    store.save_session(holdings, ["GLD", "NVDA"], {"pc_currency": "EUR", "pc_tranches": 6})
+
+    reopened = PortfolioStore(db)  # simulate a fresh session
+    loaded = reopened.load_holdings()
+    assert list(loaded["Ticker"]) == ["AAPL", "VWCE.DE"]
+    assert loaded.loc[0, "Shares"] == 10
+    assert reopened.load_watchlist() == ["GLD", "NVDA"]
+    assert reopened.load_settings()["pc_currency"] == "EUR"
+    assert reopened.load_settings()["pc_tranches"] == 6
+
+
+def test_store_missing_key_default(tmp_path):
+    store = PortfolioStore(tmp_path / "s.db")
+    assert store.get("nope", "fallback") == "fallback"
+    assert store.load_holdings() is None
+    assert store.load_watchlist(default=["X"]) == ["X"]
+    assert store.load_settings() == {}
+
+
+def test_store_recovers_from_corrupt_db(tmp_path):
+    db = tmp_path / "corrupt.db"
+    db.write_bytes(b"this is definitely not a sqlite database file")
+    # Construction must not raise; the corrupt file is quarantined.
+    store = PortfolioStore(db)
+    assert store.set("k", {"a": 1}) is True
+    assert store.get("k") == {"a": 1}
+    assert db.with_suffix(".db.corrupt").exists()
+
+
+def test_normalise_holdings_df_fills_schema():
+    df = pd.DataFrame({"Ticker": ["AAPL"], "Shares": [3]})  # missing 2 columns
+    out = normalise_holdings_df(df)
+    assert list(out.columns) == ["Ticker", "Shares", "Purchase Price", "Asset Type"]
+    assert out.loc[0, "Asset Type"] == "Stock/ETF"

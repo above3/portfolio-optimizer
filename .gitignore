@@ -14,6 +14,12 @@ env/
 # Streamlit
 .streamlit/secrets.toml
 
+# Local persistence (SQLite state DB) — never commit user data
+.portfolio_state.db
+*.db
+*.db.corrupt
+data/
+
 # OS / editor
 .DS_Store
 .idea/

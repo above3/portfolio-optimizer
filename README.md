@@ -46,6 +46,9 @@ Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 | **Historical backtesting** (equity curves + Max DD) | `optimizer.backtest_equity_curves` |
 | **GBM Monte-Carlo wealth projection** (fan chart) | `optimizer.simulate_gbm_wealth` |
 | **IBKR TWS Basket-Trader export** | `portfolio.basket_trader_csv` |
+| **Local persistence** (auto-save holdings/settings) | `portfolio.PortfolioStore` (SQLite) |
+| **Premium dark-mode UI** + neon metric cards | `app.py` (CSS injection) |
+| **Optional password gate** | `app.py` (`st.secrets`) |
 
 The chart shows the feasible-set cloud coloured by Sharpe ratio, the efficient
 frontier, the CML, the risk-free point, and star/diamond markers for the MVP,
@@ -200,6 +203,29 @@ portfolio, the tangency portfolio has the highest Sharpe ratio, the frontier is
 monotonic above the MVP, etc.).
 
 ---
+
+## Local persistence
+
+Your holdings, watchlist and every sidebar setting auto-save to a free, local
+**SQLite** database (`.portfolio_state.db`, git-ignored) via
+`portfolio.PortfolioStore`. On the next launch the table, watchlist and
+parameters are restored automatically — close the browser without losing your
+configuration. Corrupt database files are quarantined (renamed `*.corrupt`) and
+re-created rather than crashing the app. Override the location with the
+`PORTFOLIO_DB_PATH` environment variable.
+
+## Deployment
+
+The repo is ready for **free hosting on Streamlit Community Cloud**:
+
+- `.streamlit/config.toml` pre-sets the dark theme and server options.
+- `requirements.txt` lists all production dependencies.
+- A root `Dockerfile` is provided for containerised/private hosting
+  (`docker build -t portfolio-optimizer . && docker run -p 8501:8501 portfolio-optimizer`).
+- **Optional password protection**: copy `.streamlit/secrets.toml.example` to
+  `.streamlit/secrets.toml` (git-ignored) and set `APP_PASSWORD`, or paste the
+  same key under *App settings → Secrets* on Community Cloud. Leave it unset to
+  keep the app open.
 
 ## Disclaimer
 

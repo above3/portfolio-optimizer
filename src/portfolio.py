@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import math
+import os
 import re
+import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -682,3 +687,159 @@ def portfolio_config_csv(
             f"Target Value ({base_currency})": round(tgt_w * investable_capital, 2),
         })
     return pd.DataFrame(rows).to_csv(index=False)
+
+
+# --------------------------------------------------------------------------- #
+# Local persistence layer (free, file-based SQLite)
+# --------------------------------------------------------------------------- #
+_DEFAULT_DB_PATH = Path(
+    os.environ.get(
+        "PORTFOLIO_DB_PATH",
+        Path(__file__).resolve().parent.parent / ".portfolio_state.db",
+    )
+)
+
+# Columns the holdings table is normalised to on load.
+HOLDINGS_COLUMNS: tuple[str, ...] = ("Ticker", "Shares", "Purchase Price", "Asset Type")
+
+
+class PortfolioStore:
+    """Free, local SQLite key/value store for holdings, watchlist and settings.
+
+    Values are JSON-encoded in a single ``app_state`` table. Every operation is
+    defensive: a corrupt or unreadable database file is quarantined (renamed
+    with a ``.corrupt`` suffix) and re-created rather than crashing the app. The
+    class has **no Streamlit dependency** so it is fully unit-testable offline.
+    """
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self.path = Path(path) if path is not None else _DEFAULT_DB_PATH
+        self._init_schema()
+
+    # -- low-level helpers ------------------------------------------------- #
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(str(self.path), timeout=5.0)
+
+    def _create_table(self) -> None:
+        with self._connect() as con:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS app_state "
+                "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+
+    def _init_schema(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._create_table()
+        except sqlite3.DatabaseError:
+            self._quarantine_and_reset()
+        except OSError:
+            pass
+
+    def _quarantine_and_reset(self) -> None:
+        """Move a corrupt DB aside and start fresh; never raise."""
+        try:
+            if self.path.exists():
+                self.path.replace(self.path.with_suffix(self.path.suffix + ".corrupt"))
+        except OSError:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+        try:
+            self._create_table()
+        except sqlite3.DatabaseError:
+            pass
+
+    # -- key/value API ----------------------------------------------------- #
+    def set(self, key: str, value: Any) -> bool:
+        """JSON-encode and upsert ``value`` under ``key``. Returns success."""
+        try:
+            payload = json.dumps(value, default=str)
+        except (TypeError, ValueError):
+            return False
+        try:
+            with self._connect() as con:
+                con.execute(
+                    "INSERT OR REPLACE INTO app_state(key, value) VALUES (?, ?)",
+                    (key, payload),
+                )
+            return True
+        except sqlite3.DatabaseError:
+            self._quarantine_and_reset()
+            return False
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Return the JSON-decoded value for ``key`` (or ``default``)."""
+        try:
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT value FROM app_state WHERE key = ?", (key,)
+                ).fetchone()
+        except sqlite3.DatabaseError:
+            self._quarantine_and_reset()
+            return default
+        if row is None:
+            return default
+        try:
+            return json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return default
+
+    def clear(self) -> bool:
+        try:
+            with self._connect() as con:
+                con.execute("DELETE FROM app_state")
+            return True
+        except sqlite3.DatabaseError:
+            return False
+
+    # -- convenience wrappers --------------------------------------------- #
+    def save_holdings(self, holdings: pd.DataFrame) -> bool:
+        try:
+            records = holdings.where(pd.notna(holdings), None).to_dict("records")
+        except Exception:  # noqa: BLE001 - never let persistence crash the app
+            return False
+        return self.set("holdings", records)
+
+    def load_holdings(self) -> pd.DataFrame | None:
+        records = self.get("holdings")
+        if not records:
+            return None
+        try:
+            return normalise_holdings_df(pd.DataFrame(records))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def save_watchlist(self, watchlist) -> bool:
+        return self.set("watchlist", list(watchlist))
+
+    def load_watchlist(self, default=None):
+        value = self.get("watchlist", default)
+        return value if isinstance(value, list) else default
+
+    def save_settings(self, settings: dict) -> bool:
+        return self.set("settings", dict(settings))
+
+    def load_settings(self) -> dict:
+        value = self.get("settings", {})
+        return value if isinstance(value, dict) else {}
+
+    def save_session(self, holdings: pd.DataFrame, watchlist, settings: dict) -> None:
+        """Persist the full editable state in one go (best-effort)."""
+        self.save_holdings(holdings)
+        self.save_watchlist(watchlist)
+        self.save_settings(settings)
+
+
+def normalise_holdings_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure the holdings frame has exactly the expected schema/columns."""
+    out = df.copy()
+    if "Asset Type" not in out.columns:
+        out["Asset Type"] = DEFAULT_ASSET_TYPE
+    if "Purchase Price" not in out.columns:
+        out["Purchase Price"] = None
+    for col in ("Ticker", "Shares"):
+        if col not in out.columns:
+            out[col] = "" if col == "Ticker" else 0.0
+    return out[list(HOLDINGS_COLUMNS)]

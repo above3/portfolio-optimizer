@@ -1,0 +1,22 @@
+# Streamlit configuration — premium institutional dark theme + Community Cloud
+# server defaults. See https://docs.streamlit.io/develop/api-reference/configuration
+
+[theme]
+base = "dark"
+primaryColor = "#2ecc71"            # muted emerald accent
+backgroundColor = "#0e1117"         # near-black app background
+secondaryBackgroundColor = "#1a1d24"  # card / sidebar background
+textColor = "#e6e9ef"
+font = "sans serif"
+
+[server]
+headless = true
+enableXsrfProtection = true         # CSRF protection (keeps CORS enabled)
+maxUploadSize = 25                  # MB — IBKR exports are small
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = true
+toolbarMode = "viewer"
