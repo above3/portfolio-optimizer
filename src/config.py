@@ -21,6 +21,14 @@ DEFAULT_BENCHMARK: str = "SPY"
 # Maximum allocation per asset (as a decimal). 1.0 == no concentration cap.
 DEFAULT_MAX_WEIGHT: float = 1.0
 
+# Core "global anchor" All-World ETF auto-injected into the universe.
+ANCHOR_TICKER: str = "VWCE.DE"
+DEFAULT_ANCHOR_PCT: int = 20          # default slider value (%)
+ANCHOR_MAX_PCT: int = 50             # slider upper bound (%)
+
+# Example watchlist candidates screened for diversification.
+DEFAULT_WATCHLIST: str = "GLD, NVDA, AGGH.MI"
+
 # Default simulated transaction cost charged per executed trade (in dollars).
 DEFAULT_TRANSACTION_COST: float = 0.0
 
@@ -43,10 +51,11 @@ COVARIANCE_METHODS: dict[str, str] = {
 }
 
 # A small, diversified starter basket so the app is usable out of the box.
+# "Purchase Price" is optional and only used to compute unrealised P/L.
 DEMO_PORTFOLIO: list[dict[str, object]] = [
-    {"Ticker": "AAPL", "Shares": 10},
-    {"Ticker": "MSFT", "Shares": 8},
-    {"Ticker": "JNJ", "Shares": 12},
-    {"Ticker": "JPM", "Shares": 15},
-    {"Ticker": "XOM", "Shares": 20},
+    {"Ticker": "AAPL", "Shares": 10, "Purchase Price": 175.0},
+    {"Ticker": "MSFT", "Shares": 8, "Purchase Price": 330.0},
+    {"Ticker": "JNJ", "Shares": 12, "Purchase Price": 155.0},
+    {"Ticker": "JPM", "Shares": 15, "Purchase Price": 145.0},
+    {"Ticker": "XOM", "Shares": 20, "Purchase Price": 105.0},
 ]

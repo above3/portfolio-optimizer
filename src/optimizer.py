@@ -47,6 +47,34 @@ class PortfolioPoint:
 
 
 @dataclass
+class AnchorConstraint:
+    """A forced/maximum allocation to a single 'core anchor' asset.
+
+    ``mode == "exact"`` pins the weight to exactly ``weight``; ``mode == "cap"``
+    constrains it to at most ``weight``. Enforced via per-asset weight bounds,
+    which PyPortfolioOpt transforms correctly even under ``max_sharpe``.
+    """
+
+    ticker: str
+    weight: float
+    mode: str = "exact"  # "exact" | "cap"
+
+
+@dataclass
+class WatchlistRecommendation:
+    """Diversification impact of adding one watchlist asset to the pool."""
+
+    ticker: str
+    suggested_weight: float
+    base_sharpe: float
+    new_sharpe: float
+    sharpe_delta: float
+    avg_correlation: float
+    feasible: bool
+    note: str = ""
+
+
+@dataclass
 class FrontierResult:
     """Full output of an MPT analysis, ready for plotting and reporting."""
 
@@ -64,6 +92,7 @@ class FrontierResult:
     benchmark: PortfolioPoint | None = None
     max_weight: float = DEFAULT_MAX_WEIGHT
     returns_model: str = "historical"
+    anchor: AnchorConstraint | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -230,7 +259,7 @@ def _make_point(
 
 
 # --------------------------------------------------------------------------- #
-# Named optimal portfolios
+# Weight bounds (per-asset cap + optional core anchor)
 # --------------------------------------------------------------------------- #
 def _clamp_max_weight(max_weight: float, n_assets: int) -> float:
     """Clamp the per-asset cap so the weights can still sum to one."""
@@ -240,24 +269,81 @@ def _clamp_max_weight(max_weight: float, n_assets: int) -> float:
     return float(min(1.0, max(max_weight, lower)))
 
 
-def _fresh_ef(
-    mu: pd.Series, cov: pd.DataFrame, max_weight: float = DEFAULT_MAX_WEIGHT
-) -> EfficientFrontier:
-    """A new long-only EfficientFrontier with an optional per-asset cap.
+def _build_bounds(
+    assets: list[str],
+    max_weight: float,
+    anchor: AnchorConstraint | None = None,
+) -> list[tuple[float, float]]:
+    """Per-asset ``(lower, upper)`` weight bounds.
 
-    PyPortfolioOpt mutates these in place, so a fresh instance is required for
-    every optimisation.
+    Every asset is capped at ``max_weight``. A core ``anchor`` either pins its
+    weight exactly (``lower == upper == weight``) or caps it (``0, weight``).
+    The cap on the *other* assets is widened if necessary so the remaining
+    ``1 − anchor`` weight is feasible (i.e. the upper bounds can still sum to 1).
     """
-    upper = _clamp_max_weight(max_weight, len(mu))
-    return EfficientFrontier(mu, cov, weight_bounds=(0, upper))
+    n = len(assets)
+    if n == 0:
+        return []
+    base_cap = _clamp_max_weight(max_weight, n)
+
+    if anchor is None or anchor.ticker not in assets:
+        return [(0.0, base_cap)] * n
+
+    a = float(min(max(anchor.weight, 0.0), 1.0))
+    others = n - 1
+    if others == 0:
+        return [(1.0, 1.0)]  # the anchor is the only asset
+
+    # Other assets must be able to absorb the remaining (1 - a) of weight.
+    needed = (1.0 - a) / others
+    other_cap = min(1.0, max(base_cap, needed))
+
+    bounds: list[tuple[float, float]] = []
+    for asset in assets:
+        if asset == anchor.ticker:
+            bounds.append((a, a) if anchor.mode == "exact" else (0.0, a))
+        else:
+            bounds.append((0.0, other_cap))
+    return bounds
 
 
+def _ef(mu: pd.Series, cov: pd.DataFrame,
+        bounds: list[tuple[float, float]]) -> EfficientFrontier:
+    """A fresh EfficientFrontier with explicit per-asset bounds.
+
+    PyPortfolioOpt mutates instances in place, so a new one is built per solve.
+    """
+    return EfficientFrontier(mu, cov, weight_bounds=bounds)
+
+
+def _max_return_given_bounds(
+    mu: pd.Series, bounds: list[tuple[float, float]]
+) -> float:
+    """Greedy maximum attainable return subject to the weight bounds."""
+    lo = np.array([b[0] for b in bounds])
+    hi = np.array([b[1] for b in bounds])
+    w = lo.astype(float).copy()
+    remaining = 1.0 - w.sum()
+    for idx in np.argsort(mu.to_numpy())[::-1]:
+        if remaining <= 1e-12:
+            break
+        add = min(remaining, hi[idx] - w[idx])
+        w[idx] += add
+        remaining -= add
+    return float(np.dot(w, mu.to_numpy()))
+
+
+# --------------------------------------------------------------------------- #
+# Named optimal portfolios
+# --------------------------------------------------------------------------- #
 def min_variance_portfolio(
     mu: pd.Series, cov: pd.DataFrame, risk_free_rate: float,
     max_weight: float = DEFAULT_MAX_WEIGHT,
+    anchor: AnchorConstraint | None = None,
 ) -> PortfolioPoint:
     """The long-only Minimum-Variance Portfolio."""
-    ef = _fresh_ef(mu, cov, max_weight)
+    bounds = _build_bounds(list(mu.index), max_weight, anchor)
+    ef = _ef(mu, cov, bounds)
     ef.min_volatility()
     weights = dict(ef.clean_weights())
     return _make_point("Minimum Variance", weights, mu, cov, risk_free_rate)
@@ -266,13 +352,15 @@ def min_variance_portfolio(
 def max_sharpe_portfolio(
     mu: pd.Series, cov: pd.DataFrame, risk_free_rate: float,
     max_weight: float = DEFAULT_MAX_WEIGHT,
+    anchor: AnchorConstraint | None = None,
 ) -> PortfolioPoint | None:
     """The Tangency (max-Sharpe) portfolio for the given risk-free rate.
 
     Returns ``None`` if no long-only portfolio can beat the risk-free rate
     (PyPortfolioOpt raises in that situation).
     """
-    ef = _fresh_ef(mu, cov, max_weight)
+    bounds = _build_bounds(list(mu.index), max_weight, anchor)
+    ef = _ef(mu, cov, bounds)
     try:
         ef.max_sharpe(risk_free_rate=risk_free_rate)
     except Exception:  # noqa: BLE001 - surface as "no tangency" to the caller
@@ -289,22 +377,17 @@ def efficient_frontier_curve(
     cov: pd.DataFrame,
     n_points: int = N_FRONTIER_POINTS,
     max_weight: float = DEFAULT_MAX_WEIGHT,
+    anchor: AnchorConstraint | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Trace the efficient frontier as ``(volatilities, returns)`` arrays.
 
     The curve is sampled between the MVP return and the maximum attainable
-    return given the per-asset weight cap.
+    return given the per-asset weight cap and any core-anchor constraint.
     """
-    mvp = min_variance_portfolio(mu, cov, 0.0, max_weight)
+    bounds = _build_bounds(list(mu.index), max_weight, anchor)
+    mvp = min_variance_portfolio(mu, cov, 0.0, max_weight, anchor)
     r_min = mvp.expected_return
-
-    # Maximum attainable return under the cap: fill the top assets up to `upper`.
-    upper = _clamp_max_weight(max_weight, len(mu))
-    sorted_mu = np.sort(mu.to_numpy())[::-1]
-    capacity = np.full(len(sorted_mu), upper)
-    cum = np.cumsum(capacity)
-    fill = np.minimum(capacity, np.maximum(0.0, 1.0 - np.concatenate([[0.0], cum[:-1]])))
-    r_max = float(np.dot(sorted_mu, fill))
+    r_max = _max_return_given_bounds(mu, bounds)
 
     if r_max <= r_min:
         return np.array([mvp.volatility]), np.array([mvp.expected_return])
@@ -313,7 +396,7 @@ def efficient_frontier_curve(
     vols: list[float] = []
     rets: list[float] = []
     for target in targets:
-        ef = _fresh_ef(mu, cov, max_weight)
+        ef = _ef(mu, cov, bounds)
         try:
             ef.efficient_return(target_return=float(target))
         except Exception:  # noqa: BLE001 - skip infeasible targets
@@ -408,12 +491,14 @@ def analyse(
     benchmark_prices: pd.Series | None = None,
     benchmark_ticker: str | None = None,
     market_caps: pd.Series | dict | None = None,
+    anchor: AnchorConstraint | None = None,
 ) -> FrontierResult:
     """Run a full MPT analysis on a price history.
 
     Single entry point the UI calls; it wires together input estimation, the
-    named optimal portfolios (subject to the per-asset cap), the frontier curve,
-    the Monte-Carlo cloud, the benchmark point and any model-fallback notes.
+    named optimal portfolios (subject to the per-asset cap and core anchor), the
+    frontier curve, the Monte-Carlo cloud, the benchmark point and any
+    model-fallback notes.
     """
     cov = estimate_covariance(prices, cov_method=cov_method)
     mu, model_used, note = compute_expected_returns(
@@ -423,11 +508,11 @@ def analyse(
     )
     corr = correlation_from_covariance(cov)
 
-    mvp = min_variance_portfolio(mu, cov, risk_free_rate, max_weight)
-    tangency = max_sharpe_portfolio(mu, cov, risk_free_rate, max_weight)
+    mvp = min_variance_portfolio(mu, cov, risk_free_rate, max_weight, anchor)
+    tangency = max_sharpe_portfolio(mu, cov, risk_free_rate, max_weight, anchor)
 
     frontier_vol, frontier_ret = efficient_frontier_curve(
-        mu, cov, n_frontier_points, max_weight
+        mu, cov, n_frontier_points, max_weight, anchor
     )
     random_vol, random_ret, random_sharpe = random_portfolios(
         mu, cov, risk_free_rate, n_samples=n_simulations
@@ -453,5 +538,83 @@ def analyse(
         benchmark=bench,
         max_weight=_clamp_max_weight(max_weight, len(mu)),
         returns_model=model_used,
+        anchor=anchor,
         notes=notes,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Watchlist diversification screening
+# --------------------------------------------------------------------------- #
+def screen_watchlist(
+    prices: pd.DataFrame,
+    base_tickers: list[str],
+    watchlist_tickers: list[str],
+    risk_free_rate: float,
+    cov_method: str = "sample_cov",
+    max_weight: float = DEFAULT_MAX_WEIGHT,
+    anchor: AnchorConstraint | None = None,
+    returns_model: str = "historical",
+    benchmark_prices: pd.Series | None = None,
+) -> tuple[float, list[WatchlistRecommendation]]:
+    """Quantify the diversification impact of each watchlist candidate.
+
+    For every candidate, the tangency portfolio is re-optimised over
+    ``base_tickers + [candidate]`` (under the same cap/anchor) and compared to
+    the baseline tangency over ``base_tickers`` alone.
+
+    Returns ``(base_sharpe, recommendations sorted by Sharpe improvement)``.
+    """
+    base = [t for t in base_tickers if t in prices.columns]
+    if len(base) < 2:
+        return float("nan"), []
+
+    base_cov = estimate_covariance(prices[base], cov_method=cov_method)
+    base_mu, _, _ = compute_expected_returns(
+        prices[base], base_cov, returns_model=returns_model,
+        benchmark_prices=benchmark_prices, risk_free_rate=risk_free_rate,
+    )
+    base_tan = max_sharpe_portfolio(base_mu, base_cov, risk_free_rate,
+                                    max_weight, anchor)
+    base_sharpe = base_tan.sharpe if base_tan is not None else float("nan")
+
+    recs: list[WatchlistRecommendation] = []
+    seen = set(base)
+    for candidate in dict.fromkeys(watchlist_tickers):  # de-dupe, keep order
+        if candidate in seen or candidate not in prices.columns:
+            continue
+        seen.add(candidate)
+
+        pool = base + [candidate]
+        cov = estimate_covariance(prices[pool], cov_method=cov_method)
+        mu, _, _ = compute_expected_returns(
+            prices[pool], cov, returns_model=returns_model,
+            benchmark_prices=benchmark_prices, risk_free_rate=risk_free_rate,
+        )
+        tan = max_sharpe_portfolio(mu, cov, risk_free_rate, max_weight, anchor)
+
+        corr = correlation_from_covariance(cov)
+        avg_corr = float(corr.loc[candidate, base].abs().mean())
+
+        if tan is None:
+            recs.append(WatchlistRecommendation(
+                ticker=candidate, suggested_weight=0.0, base_sharpe=base_sharpe,
+                new_sharpe=float("nan"), sharpe_delta=float("nan"),
+                avg_correlation=avg_corr, feasible=False,
+                note="No tangency portfolio with this candidate at the current Rf.",
+            ))
+            continue
+
+        recs.append(WatchlistRecommendation(
+            ticker=candidate,
+            suggested_weight=float(tan.weights.get(candidate, 0.0)),
+            base_sharpe=base_sharpe,
+            new_sharpe=tan.sharpe,
+            sharpe_delta=tan.sharpe - base_sharpe,
+            avg_correlation=avg_corr,
+            feasible=True,
+        ))
+
+    recs.sort(key=lambda r: (r.sharpe_delta if r.feasible else float("-inf")),
+              reverse=True)
+    return base_sharpe, recs

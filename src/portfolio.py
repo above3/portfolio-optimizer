@@ -25,7 +25,11 @@ from .optimizer import performance
 
 @dataclass
 class CurrentPortfolio:
-    """The user's existing allocation, valued at the latest close prices."""
+    """The user's existing allocation, valued at the latest close prices.
+
+    When purchase prices are supplied the unrealised profit/loss is computed per
+    asset and in aggregate (only over assets that have a purchase price).
+    """
 
     weights: dict[str, float]
     values: dict[str, float]
@@ -34,6 +38,12 @@ class CurrentPortfolio:
     expected_return: float
     volatility: float
     sharpe: float
+    purchase_prices: dict[str, float]
+    cost_basis: dict[str, float]
+    unrealized_pnl: dict[str, float]
+    total_cost: float
+    total_pnl: float
+    has_cost_data: bool
 
 
 def build_current_portfolio(
@@ -42,12 +52,14 @@ def build_current_portfolio(
     mu: pd.Series,
     cov: pd.DataFrame,
     risk_free_rate: float,
+    purchase_prices: dict[str, float] | None = None,
 ) -> CurrentPortfolio | None:
-    """Value a holdings dict and compute its MPT performance.
+    """Value a holdings dict and compute its MPT performance and P/L.
 
     Returns ``None`` when no positive holdings are supplied (e.g. the user is
     only drafting a brand-new portfolio).
     """
+    purchase_prices = purchase_prices or {}
     values: dict[str, float] = {}
     for ticker in mu.index:
         qty = float(shares.get(ticker, 0.0) or 0.0)
@@ -63,6 +75,20 @@ def build_current_portfolio(
     weights = {ticker: value / total for ticker, value in values.items()}
     ret, vol, sharpe = performance(weights, mu, cov, risk_free_rate)
 
+    cost_basis: dict[str, float] = {}
+    unrealized_pnl: dict[str, float] = {}
+    for ticker in values:
+        pp = purchase_prices.get(ticker)
+        if pp is None or float(pp) <= 0:
+            continue
+        qty = float(shares.get(ticker, 0.0) or 0.0)
+        cost = float(pp) * qty
+        cost_basis[ticker] = cost
+        unrealized_pnl[ticker] = values[ticker] - cost
+
+    total_cost = sum(cost_basis.values())
+    total_pnl = sum(unrealized_pnl.values())
+
     return CurrentPortfolio(
         weights=weights,
         values=values,
@@ -71,6 +97,12 @@ def build_current_portfolio(
         expected_return=ret,
         volatility=vol,
         sharpe=sharpe,
+        purchase_prices={t: float(purchase_prices[t]) for t in cost_basis},
+        cost_basis=cost_basis,
+        unrealized_pnl=unrealized_pnl,
+        total_cost=total_cost,
+        total_pnl=total_pnl,
+        has_cost_data=bool(cost_basis),
     )
 
 
@@ -84,6 +116,11 @@ _SYMBOL_KEYS = {
 _QTY_KEYS = {
     "quantity", "shares", "position", "qty", "quantityshares", "positionqty",
 }
+_PRICE_KEYS = {
+    "costprice", "purchaseprice", "avgprice", "averageprice", "averagecost",
+    "avgcost", "tradeprice", "openprice", "price",
+}
+_COSTBASIS_KEYS = {"costbasis", "cost", "basis", "totalcost"}
 _SKIP_SYMBOLS = {"total", "subtotal", "", "cash", "totals"}
 
 
@@ -112,15 +149,43 @@ def _find_key_index(norm_cells: list[str], keys: set[str]) -> int | None:
     return None
 
 
-def _aggregate_positions(pairs: list[tuple[str, float]]) -> pd.DataFrame:
-    """Sum duplicate symbols and return a clean Ticker/Shares frame."""
-    totals: dict[str, float] = {}
-    for symbol, qty in pairs:
+def _lot_price(cells, price_idx: int | None, cb_idx: int | None,
+               qty: float) -> float | None:
+    """Per-share purchase price from a row: prefer an explicit price column,
+    otherwise derive it from a (total) cost-basis column divided by quantity."""
+    if price_idx is not None and price_idx < len(cells):
+        price = _to_float(cells[price_idx])
+        if price is not None and price > 0:
+            return price
+    if cb_idx is not None and cb_idx < len(cells) and qty:
+        basis = _to_float(cells[cb_idx])
+        if basis is not None and qty != 0:
+            return abs(basis / qty)
+    return None
+
+
+def _aggregate_positions(
+    lots: list[tuple[str, float, float | None]]
+) -> pd.DataFrame:
+    """Aggregate (symbol, qty, price) lots into a Ticker/Shares/Purchase Price
+    frame, summing quantities and share-weighting the purchase price."""
+    totals: dict[str, list[float]] = {}  # sym -> [qty, priced_value, priced_qty]
+    for symbol, qty, price in lots:
         sym = str(symbol).strip().upper()
         if _norm(sym) in _SKIP_SYMBOLS:
             continue
-        totals[sym] = totals.get(sym, 0.0) + qty
-    rows = [{"Ticker": s, "Shares": q} for s, q in totals.items() if q != 0]
+        rec = totals.setdefault(sym, [0.0, 0.0, 0.0])
+        rec[0] += qty
+        if price is not None:
+            rec[1] += abs(qty) * price
+            rec[2] += abs(qty)
+
+    rows = []
+    for sym, (qty, priced_value, priced_qty) in totals.items():
+        if qty == 0:
+            continue
+        avg_price = round(priced_value / priced_qty, 4) if priced_qty > 0 else None
+        rows.append({"Ticker": sym, "Shares": qty, "Purchase Price": avg_price})
     if not rows:
         raise PriceDataError("No non-zero positions found in the IBKR file.")
     return pd.DataFrame(rows)
@@ -133,18 +198,19 @@ def _positions_from_dataframe(df: pd.DataFrame) -> pd.DataFrame | None:
     qty_idx = _find_key_index(norm_cols, _QTY_KEYS)
     if sym_idx is None or qty_idx is None:
         return None
+    price_idx = _find_key_index(norm_cols, _PRICE_KEYS)
+    cb_idx = _find_key_index(norm_cols, _COSTBASIS_KEYS)
 
-    sym_col = df.columns[sym_idx]
-    qty_col = df.columns[qty_idx]
-    pairs: list[tuple[str, float]] = []
+    lots: list[tuple[str, float, float | None]] = []
     for _, row in df.iterrows():
-        qty = _to_float(row[qty_col])
-        sym = str(row[sym_col]).strip()
+        cells = list(row)
+        qty = _to_float(cells[qty_idx])
+        sym = str(cells[sym_idx]).strip()
         if sym and qty is not None:
-            pairs.append((sym, qty))
-    if not pairs:
+            lots.append((sym, qty, _lot_price(cells, price_idx, cb_idx, qty)))
+    if not lots:
         return None
-    return _aggregate_positions(pairs)
+    return _aggregate_positions(lots)
 
 
 def _positions_from_sections(text: str) -> pd.DataFrame:
@@ -165,9 +231,11 @@ def _positions_from_sections(text: str) -> pd.DataFrame:
         qty_idx = _find_key_index(norm, _QTY_KEYS)
         if sym_idx is None or qty_idx is None:
             continue
+        price_idx = _find_key_index(norm, _PRICE_KEYS)
+        cb_idx = _find_key_index(norm, _COSTBASIS_KEYS)
 
         section = _norm(row[0])
-        pairs: list[tuple[str, float]] = []
+        lots: list[tuple[str, float, float | None]] = []
         for data_row in rows[i + 1:]:
             if len(data_row) <= max(sym_idx, qty_idx):
                 continue
@@ -176,9 +244,9 @@ def _positions_from_sections(text: str) -> pd.DataFrame:
             qty = _to_float(data_row[qty_idx])
             sym = str(data_row[sym_idx]).strip()
             if sym and qty is not None:
-                pairs.append((sym, qty))
-        if pairs:
-            return _aggregate_positions(pairs)
+                lots.append((sym, qty, _lot_price(data_row, price_idx, cb_idx, qty)))
+        if lots:
+            return _aggregate_positions(lots)
 
     raise PriceDataError(
         "Could not locate 'Symbol'/'Ticker' and 'Quantity'/'Shares' columns in "
@@ -187,11 +255,12 @@ def _positions_from_sections(text: str) -> pd.DataFrame:
 
 
 def parse_ibkr_positions(file) -> pd.DataFrame:
-    """Parse an IBKR position/activity CSV into a ``Ticker``/``Shares`` frame.
+    """Parse an IBKR CSV into a ``Ticker``/``Shares``/``Purchase Price`` frame.
 
     Handles both the simple flat Flex-Query export (a single table with
     ``Symbol`` and ``Quantity`` columns) and the multi-section activity
-    statement. Duplicate lots for the same symbol are summed.
+    statement. Duplicate lots for the same symbol are summed, and the purchase
+    price (from a cost-price or cost-basis column, if present) is share-weighted.
 
     Raises
     ------

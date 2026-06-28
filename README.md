@@ -33,6 +33,9 @@ Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 | **Whole-share rounding + residual cash + fees** | `portfolio.reallocation_plan` |
 | **Market-benchmark reference point** | `optimizer.benchmark_point` + `visualization` |
 | **Black-Litterman market-implied returns** | `optimizer.black_litterman_implied_returns` |
+| **Hybrid holdings table** (IBKR + manual + purchase price / P&L) | `app.py` + `portfolio` |
+| **Core global anchor** (VWCE.DE fixed/capped weight) | `optimizer.AnchorConstraint` |
+| **Watchlist diversification scanner** | `optimizer.screen_watchlist` |
 
 The chart shows the feasible-set cloud coloured by Sharpe ratio, the efficient
 frontier, the CML, the risk-free point, and star/diamond markers for the MVP,
@@ -58,13 +61,38 @@ Hover any point to see its return, volatility, Sharpe ratio and weights.
 - **Estimated Transaction Cost per Trade ($)** — totalled across executed trades
   and subtracted from the rebalanced portfolio's expected return (net-of-fee).
 
-### Importing IBKR positions
+### Hybrid holdings table (IBKR + manual + Trade Republic …)
 
 Drag an Interactive Brokers **position report** or **activity statement** CSV
-onto the uploader in the main panel. The parser locates `Symbol`/`Ticker` and
-`Quantity`/`Shares` columns (handling both the flat Flex-Query export and the
-multi-section activity statement), auto-fills the holdings table and runs the
-optimisation immediately.
+onto the uploader: the parser locates `Symbol`/`Ticker`, `Quantity`/`Shares` and
+the cost price (from a cost-price or cost-basis column), auto-fills the table and
+runs the optimisation. The table is fully editable — click **+** to add assets
+held on other brokers (Trade Republic, Degiro, …). Each row has:
+
+- **Ticker** — any Yahoo Finance symbol, stocks **and** bonds/bond ETFs
+  (`AAPL`, `VWCE.DE`, `AGGH.MI`, `EMBE.MI`).
+- **Shares** — units held (`0` = include in the optimisation as watch-only).
+- **Purchase Price** — optional average buy price; drives the per-asset and
+  total **unrealised P/L**.
+
+### Core global anchor (VWCE.DE)
+
+`VWCE.DE` (an all-world ETF) is auto-injected into the universe as a stabilising
+core. The **Core Global Anchor Allocation (VWCE) %** slider (0–50%, default 20%)
+either **pins** its weight exactly or **caps** it (toggle), enforced through
+per-asset weight bounds. The remaining `(100 − slider)%` is optimised across your
+own assets. The other assets' caps are automatically widened if needed to keep
+the problem feasible.
+
+### Watchlist diversification scanner
+
+Type comma-separated tickers into *Enter Tickers to screen for Diversification*.
+For each candidate the engine re-optimises the tangency portfolio over
+`your pool + candidate` (under the same cap/anchor) and shows a recommendation
+card: the suggested weight, the Max-Sharpe improvement (old → new) and the
+candidate's average correlation to your pool. Enlarging the universe can never
+lower the attainable Sharpe, so the cards highlight which candidates genuinely
+shift your efficient frontier upwards.
 
 ---
 

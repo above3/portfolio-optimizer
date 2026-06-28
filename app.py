@@ -20,7 +20,14 @@ import streamlit as st
 
 from src import config
 from src.data_loader import PriceDataError, fetch_price_history, fetch_risk_free_rate
-from src.optimizer import FrontierResult, PortfolioPoint, analyse
+from src.optimizer import (
+    AnchorConstraint,
+    FrontierResult,
+    PortfolioPoint,
+    WatchlistRecommendation,
+    analyse,
+    screen_watchlist,
+)
 from src.portfolio import (
     CurrentPortfolio,
     ReallocationResult,
@@ -72,6 +79,13 @@ def _load_prices_sample(tickers: tuple[str, ...], benchmark: str | None, lookbac
                                            benchmark=benchmark))
 
 
+def _make_anchor(ticker: str | None, weight: float, mode: str) -> AnchorConstraint | None:
+    """Build an AnchorConstraint, or None when no anchor ticker is active."""
+    if not ticker:
+        return None
+    return AnchorConstraint(ticker=ticker, weight=weight, mode=mode)
+
+
 @st.cache_data(show_spinner=False)
 def _run_analysis(
     prices: pd.DataFrame,
@@ -82,6 +96,9 @@ def _run_analysis(
     returns_model: str,
     benchmark_prices: pd.Series | None,
     benchmark_ticker: str | None,
+    anchor_ticker: str | None,
+    anchor_weight: float,
+    anchor_mode: str,
 ) -> FrontierResult:
     return analyse(
         prices,
@@ -92,6 +109,34 @@ def _run_analysis(
         returns_model=returns_model,
         benchmark_prices=benchmark_prices,
         benchmark_ticker=benchmark_ticker,
+        anchor=_make_anchor(anchor_ticker, anchor_weight, anchor_mode),
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _run_watchlist(
+    prices: pd.DataFrame,
+    base_tickers: tuple[str, ...],
+    watchlist_tickers: tuple[str, ...],
+    risk_free_rate: float,
+    cov_method: str,
+    max_weight: float,
+    returns_model: str,
+    benchmark_prices: pd.Series | None,
+    anchor_ticker: str | None,
+    anchor_weight: float,
+    anchor_mode: str,
+) -> tuple[float, list[WatchlistRecommendation]]:
+    return screen_watchlist(
+        prices,
+        base_tickers=list(base_tickers),
+        watchlist_tickers=list(watchlist_tickers),
+        risk_free_rate=risk_free_rate,
+        cov_method=cov_method,
+        max_weight=max_weight,
+        anchor=_make_anchor(anchor_ticker, anchor_weight, anchor_mode),
+        returns_model=returns_model,
+        benchmark_prices=benchmark_prices,
     )
 
 
@@ -184,6 +229,20 @@ def render_sidebar() -> dict:
         index=0, help="Ledoit-Wolf shrinkage is more stable for short histories.",
     )
 
+    st.sidebar.markdown("### 🌍 Core global anchor")
+    anchor_pct = st.sidebar.slider(
+        f"Core Global Anchor Allocation ({config.ANCHOR_TICKER}) %",
+        min_value=0, max_value=config.ANCHOR_MAX_PCT,
+        value=config.DEFAULT_ANCHOR_PCT, step=1,
+        help=f"Reserves part of the portfolio for the all-world ETF "
+             f"{config.ANCHOR_TICKER}. The rest is optimised across your assets.",
+    )
+    anchor_exact = st.sidebar.toggle(
+        "Pin anchor weight exactly", value=True,
+        help="On: anchor weight is fixed at the slider value. "
+             "Off: the slider is an upper cap and the optimiser may use less.",
+    )
+
     st.sidebar.markdown("### 🛡️ Constraints & friction")
     max_weight_pct = st.sidebar.slider(
         "Max Allocation per Asset (%)", min_value=5, max_value=100,
@@ -226,6 +285,9 @@ def render_sidebar() -> dict:
         "returns_model": config.RETURNS_MODELS[returns_label],
         "cov_method": config.COVARIANCE_METHODS[cov_label],
         "max_weight": max_weight_pct / 100.0,
+        "anchor_ticker": config.ANCHOR_TICKER,
+        "anchor_weight": anchor_pct / 100.0,
+        "anchor_mode": "exact" if anchor_exact else "cap",
         "allow_fractional": not disable_fractional,
         "transaction_cost": float(transaction_cost),
         "capital": float(capital),
@@ -236,14 +298,15 @@ def render_sidebar() -> dict:
 # --------------------------------------------------------------------------- #
 # Holdings input (IBKR import + editable table)
 # --------------------------------------------------------------------------- #
-def render_data_input() -> pd.DataFrame:
+def render_data_input() -> tuple[pd.DataFrame, list[str]]:
     st.subheader("1 · Your portfolio")
 
     uploaded = st.file_uploader(
         "📥 Drag and Drop your IBKR Position Report (CSV)", type=["csv"],
         key="ibkr_uploader",
         help="Interactive Brokers position or activity export. Detected "
-             "positions auto-fill the table below and run the optimisation.",
+             "positions (with purchase price, when present) auto-fill the table "
+             "below and run the optimisation.",
     )
     if uploaded is not None:
         file_id = getattr(uploaded, "file_id", f"{uploaded.name}:{uploaded.size}")
@@ -259,9 +322,10 @@ def render_data_input() -> pd.DataFrame:
                 st.error(f"Could not parse IBKR CSV: {exc}")
 
     st.caption(
-        "Enter the tickers you hold (or are considering) and the number of "
-        "shares. Leave shares at 0 to include an asset in the optimisation "
-        "without marking it as a current holding."
+        "Add tickers from **any** broker (IBKR import, Trade Republic, etc.) — "
+        "stocks **and** bonds/bond ETFs (e.g. `AGGH.MI`, `EMBE.MI`). Click **+** "
+        "to add rows. *Purchase Price* is optional and only used for P/L. Leave "
+        "shares at 0 to include an asset in the optimisation without holding it."
     )
     edited = st.data_editor(
         st.session_state.holdings_df,
@@ -269,29 +333,50 @@ def render_data_input() -> pd.DataFrame:
         use_container_width=True,
         column_config={
             "Ticker": st.column_config.TextColumn(
-                "Ticker", help="Yahoo Finance symbol, e.g. AAPL, MSFT, BTC-USD."),
+                "Ticker", help="Yahoo Finance symbol, e.g. AAPL, VWCE.DE, AGGH.MI."),
             "Shares": st.column_config.NumberColumn(
-                "Shares", help="Number of shares currently held."),
+                "Shares", help="Number of units held (0 = watch-only)."),
+            "Purchase Price": st.column_config.NumberColumn(
+                "Purchase Price", help="Optional avg buy price for profit/loss.",
+                min_value=0.0, format="%.2f"),
         },
         key=f"holdings_editor_{st.session_state.editor_version}",
     )
     st.session_state.holdings_df = edited
-    return edited
+
+    watchlist_raw = st.text_input(
+        "🔭 Enter Tickers to screen for Diversification "
+        "(comma-separated, e.g. GLD, NVDA, LVMH)",
+        value=config.DEFAULT_WATCHLIST,
+        help="These are not added to your portfolio — the engine simulates "
+             "adding each one to show its diversification impact.",
+    )
+    watchlist = [t.strip().upper() for t in watchlist_raw.split(",") if t.strip()]
+    return edited, list(dict.fromkeys(watchlist))
 
 
-def _parse_holdings(edited: pd.DataFrame) -> dict[str, float]:
-    """Turn the editor frame into a {ticker: shares} mapping."""
-    holdings: dict[str, float] = {}
+def _parse_holdings(edited: pd.DataFrame) -> tuple[dict[str, float], dict[str, float]]:
+    """Turn the editor frame into ``(shares, purchase_prices)`` mappings."""
+    shares: dict[str, float] = {}
+    purchase_prices: dict[str, float] = {}
     for _, row in edited.iterrows():
         ticker = str(row.get("Ticker", "") or "").strip().upper()
         if not ticker:
             continue
         try:
-            shares = float(row.get("Shares", 0) or 0)
+            qty = float(row.get("Shares", 0) or 0)
         except (TypeError, ValueError):
-            shares = 0.0
-        holdings[ticker] = holdings.get(ticker, 0.0) + shares
-    return holdings
+            qty = 0.0
+        shares[ticker] = shares.get(ticker, 0.0) + qty
+
+        pp = row.get("Purchase Price", None)
+        try:
+            pp = float(pp) if pp is not None and str(pp) != "" else None
+        except (TypeError, ValueError):
+            pp = None
+        if pp and pp > 0:
+            purchase_prices[ticker] = pp
+    return shares, purchase_prices
 
 
 # --------------------------------------------------------------------------- #
@@ -317,7 +402,13 @@ def _metric_columns(result: FrontierResult, current: CurrentPortfolio | None) ->
             st.metric("Expected return", f"{current.expected_return * 100:.2f}%")
             st.metric("Volatility", f"{current.volatility * 100:.2f}%")
             st.metric("Sharpe ratio", f"{current.sharpe:.2f}")
-            st.metric("Total value", f"${current.total_value:,.0f}")
+            if current.has_cost_data:
+                pnl_pct = (current.total_pnl / current.total_cost * 100
+                           if current.total_cost > 0 else 0.0)
+                st.metric("Total value", f"${current.total_value:,.0f}",
+                          delta=f"${current.total_pnl:,.0f} ({pnl_pct:+.1f}%) P/L")
+            else:
+                st.metric("Total value", f"${current.total_value:,.0f}")
 
     with cols[1]:
         st.markdown("#### 🚀 Max Sharpe (Tangency)")
@@ -401,16 +492,87 @@ def _render_reallocation(
                       delta_color="inverse")
 
 
+def _pnl_breakdown(current: CurrentPortfolio) -> None:
+    """Per-asset unrealised P/L table inside an expander."""
+    rows = []
+    for ticker in sorted(current.values):
+        value = current.values[ticker]
+        pp = current.purchase_prices.get(ticker)
+        pnl = current.unrealized_pnl.get(ticker)
+        rows.append({
+            "Ticker": ticker,
+            "Shares": round(current.shares.get(ticker, 0.0), 4),
+            "Purchase $": round(pp, 2) if pp else None,
+            "Market value $": round(value, 2),
+            "Unrealised P/L $": round(pnl, 2) if pnl is not None else None,
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
+def _render_watchlist(
+    base_sharpe: float,
+    recommendations: list[WatchlistRecommendation],
+    anchor_ticker: str | None,
+) -> None:
+    st.markdown("---")
+    st.subheader("7 · Watchlist — diversification scanner")
+    if not recommendations:
+        st.info("Add tickers to the watchlist box above to screen candidates "
+                "for diversification benefit.")
+        return
+
+    st.caption(
+        f"Baseline Max Sharpe of your current pool"
+        f"{' (incl. anchor)' if anchor_ticker else ''}: **{base_sharpe:.2f}**. "
+        "Each card simulates adding one candidate to the optimisation pool."
+    )
+
+    for rec in recommendations:
+        if not rec.feasible:
+            st.warning(f"**{rec.ticker}** — {rec.note}")
+            continue
+        improves = rec.sharpe_delta > 1e-4
+        with st.container(border=True):
+            cols = st.columns([2, 1, 1, 1])
+            cols[0].markdown(f"### {'✅' if improves else '➖'} {rec.ticker}")
+            cols[1].metric("Suggested weight", f"{rec.suggested_weight * 100:.1f}%")
+            cols[2].metric("Max Sharpe",
+                           f"{rec.new_sharpe:.2f}",
+                           delta=f"{rec.sharpe_delta:+.2f}")
+            cols[3].metric("Avg |ρ| to pool", f"{rec.avg_correlation:.2f}")
+            if improves:
+                st.success(
+                    f"Adding **{rec.ticker}** with a suggested weight of "
+                    f"**{rec.suggested_weight * 100:.1f}%** would shift your "
+                    f"Efficient Frontier upwards, improving your Max Sharpe Ratio "
+                    f"from **{rec.base_sharpe:.2f}** to **{rec.new_sharpe:.2f}** "
+                    f"(+{rec.sharpe_delta:.2f}) by lowering overall portfolio "
+                    f"covariance (avg ρ to your assets ≈ {rec.avg_correlation:.2f})."
+                )
+            else:
+                st.caption(
+                    f"Adding **{rec.ticker}** would not improve your risk-adjusted "
+                    f"return (Max Sharpe {rec.base_sharpe:.2f} → {rec.new_sharpe:.2f}); "
+                    f"its average correlation to your pool is {rec.avg_correlation:.2f}."
+                )
+
+
 def render_results(
     result: FrontierResult,
     current: CurrentPortfolio | None,
     latest_prices: pd.Series,
     params: dict,
+    watchlist: tuple[float, list[WatchlistRecommendation]] | None = None,
 ) -> None:
     st.subheader("3 · The Markowitz bullet")
+    caption_bits = [f"Returns model: **{result.returns_model.replace('_', ' ').title()}**"]
     if result.max_weight < 1.0:
-        st.caption(f"Per-asset weight capped at **{result.max_weight * 100:.0f}%**. "
-                   f"Returns model: **{result.returns_model.replace('_', ' ').title()}**.")
+        caption_bits.append(f"per-asset cap **{result.max_weight * 100:.0f}%**")
+    if result.anchor is not None and result.anchor.weight > 0:
+        verb = "fixed at" if result.anchor.mode == "exact" else "capped at"
+        caption_bits.append(
+            f"anchor **{result.anchor.ticker}** {verb} **{result.anchor.weight * 100:.0f}%**")
+    st.caption(" · ".join(caption_bits) + ".")
     for note in result.notes:
         st.warning(note)
     st.plotly_chart(efficient_frontier_figure(result, current), use_container_width=True)
@@ -418,6 +580,9 @@ def render_results(
     st.subheader("4 · Portfolio comparison")
     _benchmark_banner(result)
     _metric_columns(result, current)
+    if current is not None and current.has_cost_data:
+        with st.expander("📑 Unrealised profit / loss by asset"):
+            _pnl_breakdown(current)
 
     st.markdown("---")
     st.subheader("5 · Suggested allocations & reallocation")
@@ -452,6 +617,11 @@ def render_results(
             use_container_width=True,
         )
 
+    if watchlist is not None:
+        base_sharpe, recommendations = watchlist
+        anchor_ticker = result.anchor.ticker if result.anchor is not None else None
+        _render_watchlist(base_sharpe, recommendations, anchor_ticker)
+
 
 # --------------------------------------------------------------------------- #
 # Main
@@ -467,7 +637,7 @@ def main() -> None:
     )
 
     params = render_sidebar()
-    edited = render_data_input()
+    edited, watchlist = render_data_input()
 
     run = st.button("🔍 Optimize portfolio", type="primary", use_container_width=True)
     auto_run = st.session_state.auto_run
@@ -478,13 +648,18 @@ def main() -> None:
                 "sidebar, then click **Optimize portfolio**.")
         return
 
-    holdings = _parse_holdings(edited)
-    if len(holdings) < 2:
-        st.error("Please enter at least **two** distinct tickers to optimise.")
+    shares, purchase_prices = _parse_holdings(edited)
+    if len(shares) < 1:
+        st.error("Please enter at least one ticker to optimise.")
         return
 
-    # ---- Load prices (live / offline sample / CSV) ----
-    tickers = tuple(sorted(holdings))
+    # Build the fetch universe: user assets + the global anchor + watchlist.
+    anchor_ticker = params["anchor_ticker"]
+    user_tickers = set(shares)
+    base_set = user_tickers | {anchor_ticker}
+    watchlist_extra = [t for t in watchlist if t not in base_set]
+    universe = tuple(sorted(base_set | set(watchlist_extra)))
+
     source = params["data_source"]
     benchmark = params["benchmark"]
     spinner_msg = {
@@ -496,16 +671,16 @@ def main() -> None:
     with st.spinner(spinner_msg):
         try:
             if source == "Yahoo Finance (live)":
-                data = _load_prices_live(tickers, benchmark, params["lookback"])
+                data = _load_prices_live(universe, benchmark, params["lookback"])
             elif source == "Sample data (offline)":
-                data = _load_prices_sample(tickers, benchmark, params["lookback"])
+                data = _load_prices_sample(universe, benchmark, params["lookback"])
             else:  # Upload CSV
                 if params["uploaded_csv"] is None:
                     st.error("Please upload a price CSV in the sidebar, or pick "
                              "another data source.")
                     return
                 data = _as_dict(load_prices_from_csv(
-                    params["uploaded_csv"], tickers=list(tickers), benchmark=benchmark))
+                    params["uploaded_csv"], tickers=list(universe), benchmark=benchmark))
         except PriceDataError as exc:
             st.error(f"Data error: {exc}")
             if source == "Yahoo Finance (live)":
@@ -516,32 +691,47 @@ def main() -> None:
             st.error(f"Unexpected error while loading prices: {exc}")
             return
 
+    valid = set(data["valid_tickers"])
+    base_pool = sorted(t for t in base_set if t in valid)
+    watchlist_valid = [t for t in watchlist if t in valid and t not in base_set]
+    anchor_loaded = anchor_ticker in valid
+
     if data["failed_tickers"]:
         st.warning("No data for: " + ", ".join(data["failed_tickers"]) + ". Excluded.")
-    if len(data["valid_tickers"]) < 2:
-        st.error("Fewer than two tickers returned usable data. Cannot optimise.")
+    if len(base_pool) < 2:
+        st.error("Fewer than two assets (your holdings + anchor) returned usable "
+                 "data. Add more tickers or check the symbols.")
         return
 
     st.subheader("2 · Data")
     bench_note = (f" · benchmark **{data['benchmark_ticker']}**"
                   if data.get("benchmark_ticker") else "")
+    anchor_note = (f" · anchor **{anchor_ticker}**" if anchor_loaded else "")
+    wl_note = (f" · watchlist **{len(watchlist_valid)}**" if watchlist_valid else "")
     st.caption(
-        f"Source: **{source}** · Loaded **{len(data['valid_tickers'])}** assets{bench_note} · "
+        f"Source: **{source}** · Optimising **{len(base_pool)}** assets"
+        f"{anchor_note}{bench_note}{wl_note} · "
         f"{data['start']} → {data['end']} ({len(data['prices'])} trading days)."
     )
     if benchmark and not data.get("benchmark_ticker"):
         st.warning(f"Benchmark **{benchmark}** could not be loaded from this data "
                    "source; benchmark marker and Black-Litterman proxy disabled.")
+    if not anchor_loaded and params["anchor_weight"] > 0:
+        st.warning(f"Anchor **{anchor_ticker}** could not be loaded; optimising "
+                   "without the global-anchor constraint.")
     if source == "Sample data (offline)":
         st.warning(
             "⚠️ Using **synthetic** prices for demonstration — not real market data.",
             icon="⚠️",
         )
 
+    eff_anchor_ticker = anchor_ticker if anchor_loaded else None
+    base_prices = data["prices"][base_pool]
+
     # ---- Run optimisation ----
     with st.spinner("Computing efficient frontier…"):
         result = _run_analysis(
-            data["prices"],
+            base_prices,
             params["risk_free_rate"],
             params["cov_method"],
             params["n_simulations"],
@@ -549,13 +739,35 @@ def main() -> None:
             params["returns_model"],
             data["benchmark_prices"],
             data["benchmark_ticker"],
+            eff_anchor_ticker,
+            params["anchor_weight"],
+            params["anchor_mode"],
         )
         current = build_current_portfolio(
-            holdings, data["latest_prices"], result.mu, result.cov,
-            params["risk_free_rate"],
+            shares, data["latest_prices"], result.mu, result.cov,
+            params["risk_free_rate"], purchase_prices=purchase_prices,
         )
 
-    render_results(result, current, data["latest_prices"], params)
+    # ---- Watchlist diversification screening ----
+    watchlist_result = None
+    if watchlist_valid:
+        with st.spinner("Scanning watchlist for diversification…"):
+            screen_prices = data["prices"][base_pool + watchlist_valid]
+            watchlist_result = _run_watchlist(
+                screen_prices,
+                tuple(base_pool),
+                tuple(watchlist_valid),
+                params["risk_free_rate"],
+                params["cov_method"],
+                params["max_weight"],
+                params["returns_model"],
+                data["benchmark_prices"],
+                eff_anchor_ticker,
+                params["anchor_weight"],
+                params["anchor_mode"],
+            )
+
+    render_results(result, current, data["latest_prices"], params, watchlist_result)
 
 
 if __name__ == "__main__":

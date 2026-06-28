@@ -16,7 +16,12 @@ import pytest
 
 from src import optimizer
 from src.data_loader import PriceDataError
-from src.optimizer import benchmark_point, black_litterman_implied_returns
+from src.optimizer import (
+    AnchorConstraint,
+    benchmark_point,
+    black_litterman_implied_returns,
+    screen_watchlist,
+)
 from src.portfolio import (
     build_current_portfolio,
     parse_ibkr_positions,
@@ -266,3 +271,95 @@ def test_parse_ibkr_activity_statement():
 def test_parse_ibkr_missing_columns_raises():
     with pytest.raises(PriceDataError):
         parse_ibkr_positions(io.StringIO("Foo,Bar\n1,2\n3,4\n"))
+
+
+def test_parse_ibkr_with_cost_price():
+    csv_text = (
+        "Symbol,Quantity,Cost Price\n"
+        "AAPL,10,150.0\n"
+        "AAPL,10,170.0\n"  # second lot -> share-weighted avg = 160
+        "MSFT,5,300.0\n"
+    )
+    df = parse_ibkr_positions(io.StringIO(csv_text)).set_index("Ticker")
+    assert df.loc["AAPL", "Shares"] == 20
+    assert df.loc["AAPL", "Purchase Price"] == pytest.approx(160.0)
+    assert df.loc["MSFT", "Purchase Price"] == pytest.approx(300.0)
+
+
+def test_parse_ibkr_section_derives_price_from_cost_basis():
+    csv_text = (
+        "Statement,Header,Field,Value\n"
+        "Statement,Data,Broker,IBKR\n"
+        "Positions,Header,DataDiscriminator,Symbol,Quantity,Cost Basis\n"
+        "Positions,Data,Summary,AAPL,100,15000\n"
+        "Positions,Data,Summary,MSFT,50,15000\n"
+    )
+    df = parse_ibkr_positions(io.StringIO(csv_text)).set_index("Ticker")
+    assert df.loc["AAPL", "Purchase Price"] == pytest.approx(150.0)  # 15000 / 100
+    assert df.loc["MSFT", "Purchase Price"] == pytest.approx(300.0)  # 15000 / 50
+
+
+def test_current_portfolio_unrealized_pnl(inputs):
+    mu, cov = inputs
+    latest = pd.Series({"AAA": 120.0, "BBB": 90.0, "CCC": 100.0})
+    shares = {"AAA": 10, "BBB": 5}
+    pp = {"AAA": 100.0, "BBB": 100.0}
+    cur = build_current_portfolio(shares, latest, mu, cov, 0.02, purchase_prices=pp)
+    assert cur.has_cost_data
+    assert cur.unrealized_pnl["AAA"] == pytest.approx(200.0)   # (120-100)*10
+    assert cur.unrealized_pnl["BBB"] == pytest.approx(-50.0)   # (90-100)*5
+    assert cur.total_pnl == pytest.approx(150.0)
+    assert cur.total_cost == pytest.approx(1500.0)
+
+
+# --------------------------------------------------------------------------- #
+# Core global anchor constraint
+# --------------------------------------------------------------------------- #
+def test_anchor_exact_pins_weight(inputs):
+    mu, cov = inputs
+    anchor = AnchorConstraint("CCC", 0.30, "exact")
+    tan = optimizer.max_sharpe_portfolio(mu, cov, 0.02, anchor=anchor)
+    mvp = optimizer.min_variance_portfolio(mu, cov, 0.02, anchor=anchor)
+    assert tan is not None
+    assert tan.weights["CCC"] == pytest.approx(0.30, abs=1e-3)
+    assert mvp.weights["CCC"] == pytest.approx(0.30, abs=1e-3)
+
+
+def test_anchor_cap_limits_weight(inputs):
+    mu, cov = inputs
+    anchor = AnchorConstraint("CCC", 0.10, "cap")
+    tan = optimizer.max_sharpe_portfolio(mu, cov, 0.02, anchor=anchor)
+    assert tan is not None
+    assert tan.weights["CCC"] <= 0.10 + 1e-4
+
+
+def test_anchor_remains_feasible_under_tight_cap(inputs):
+    """Anchor above the per-asset cap must widen the other assets' caps."""
+    mu, cov = inputs
+    anchor = AnchorConstraint("CCC", 0.40, "exact")
+    mvp = optimizer.min_variance_portfolio(mu, cov, 0.02, max_weight=0.05, anchor=anchor)
+    assert mvp.weights["CCC"] == pytest.approx(0.40, abs=1e-3)
+    assert abs(sum(mvp.weights.values()) - 1.0) < 1e-4
+
+
+# --------------------------------------------------------------------------- #
+# Watchlist diversification screening
+# --------------------------------------------------------------------------- #
+def test_screen_watchlist_improves_or_holds_sharpe(prices):
+    base = ["AAA", "BBB"]
+    base_sharpe, recs = screen_watchlist(prices, base, ["CCC"], risk_free_rate=0.02)
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec.ticker == "CCC" and rec.feasible
+    assert rec.base_sharpe == pytest.approx(base_sharpe)
+    # Enlarging the asset universe cannot lower the attainable max Sharpe.
+    assert rec.new_sharpe >= base_sharpe - 1e-6
+    assert rec.sharpe_delta == pytest.approx(rec.new_sharpe - base_sharpe)
+    assert 0.0 <= rec.avg_correlation <= 1.0
+
+
+def test_screen_watchlist_skips_unknown_and_duplicates(prices):
+    base = ["AAA", "BBB"]
+    # "AAA" already in base, "ZZZ" not in the price panel -> both skipped.
+    base_sharpe, recs = screen_watchlist(prices, base, ["AAA", "ZZZ", "CCC"], 0.02)
+    assert [r.ticker for r in recs] == ["CCC"]

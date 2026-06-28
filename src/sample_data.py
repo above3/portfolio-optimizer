@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
-from io import BytesIO, StringIO
+from io import StringIO
 
 import numpy as np
 import pandas as pd
@@ -47,6 +47,18 @@ _KNOWN_PROFILES: dict[str, tuple[float, float, str]] = {
     "TSLA": (0.28, 0.55, "auto"),
     "SPY": (0.10, 0.16, "market"),
     "QQQ": (0.13, 0.20, "market"),
+    # All-world / broad-market ETFs (the "global anchor").
+    "VWCE.DE": (0.09, 0.15, "market"),
+    "IWDA.AS": (0.09, 0.15, "market"),
+    "ACWI": (0.09, 0.16, "market"),
+    # Bonds / bond ETFs — low return, low volatility, weakly correlated.
+    "AGGH.MI": (0.030, 0.05, "bond"),
+    "EMBE.MI": (0.045, 0.09, "bond"),
+    "AGG": (0.030, 0.05, "bond"),
+    "TLT": (0.035, 0.14, "bond"),
+    # Commodities / gold — a classic diversifier.
+    "GLD": (0.06, 0.15, "gold"),
+    "LVMH": (0.11, 0.27, "consumer"),
 }
 
 # Factor loadings: how much of each asset's return is market vs sector vs idio.
