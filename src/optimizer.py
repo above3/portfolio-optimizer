@@ -414,6 +414,52 @@ def max_sharpe_portfolio(
     return None
 
 
+def buy_only_max_sharpe(
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    current_values: dict[str, float],
+    total_capital: float,
+    risk_free_rate: float,
+    max_weight: float = DEFAULT_MAX_WEIGHT,
+    sector_map: dict[str, str] | None = None,
+    sector_max: float = 1.0,
+) -> PortfolioPoint | None:
+    """Max-Sharpe target reachable by **buying only** (no sells).
+
+    Each asset's weight is lower-bounded by its *current* value fraction of the
+    post-injection ``total_capital``, so the solver can only deploy the new
+    tranche cash to raise allocations toward the optimum — never reduce an
+    existing position. This eliminates capital-gains tax and sell-side fees.
+
+    Returns ``None`` if no feasible no-sell tangency portfolio exists.
+    """
+    assets = list(mu.index)
+    n = len(assets)
+    if n == 0:
+        return None
+    if total_capital <= 0:
+        return max_sharpe_portfolio(mu, cov, risk_free_rate, max_weight, None,
+                                    sector_map, sector_max)
+
+    cap = _clamp_max_weight(max_weight, n)
+    lowers = {a: min(max(float(current_values.get(a, 0.0) or 0.0) / total_capital, 0.0), 1.0)
+              for a in assets}
+    total_lower = sum(lowers.values())
+    if total_lower > 1.0:  # current holdings already exceed the budget -> scale
+        lowers = {a: v / total_lower for a, v in lowers.items()}
+
+    bounds = [(lowers[a], max(cap, lowers[a])) for a in assets]
+    for sm, smax in ((sector_map, sector_max), (None, 1.0)):
+        ef = _ef(mu, cov, bounds, sm, smax)
+        try:
+            ef.max_sharpe(risk_free_rate=risk_free_rate)
+        except Exception:  # noqa: BLE001 - drop sector caps, then give up
+            continue
+        return _make_point("Buy-Only Target", dict(ef.clean_weights()),
+                           mu, cov, risk_free_rate)
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Efficient frontier curve
 # --------------------------------------------------------------------------- #

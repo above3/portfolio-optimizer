@@ -15,12 +15,13 @@ import pandas as pd
 import pytest
 
 from src import optimizer
-from src.data_loader import PriceDataError, convert_to_base_currency
+from src.data_loader import PriceDataError, apply_regime, convert_to_base_currency
 from src.optimizer import (
     AnchorConstraint,
     backtest_equity_curves,
     benchmark_point,
     black_litterman_implied_returns,
+    buy_only_max_sharpe,
     screen_watchlist,
     simulate_gbm_wealth,
 )
@@ -32,6 +33,9 @@ from src.portfolio import (
     clean_ib_symbol,
     deployment_plan,
     guess_asset_type,
+    hierarchical_clusters,
+    ibkr_exchange_for,
+    map_ibkr_symbol,
     normalise_holdings_df,
     parse_ibkr_positions,
     portfolio_config_csv,
@@ -597,3 +601,85 @@ def test_normalise_holdings_df_fills_schema():
     out = normalise_holdings_df(df)
     assert list(out.columns) == ["Ticker", "Shares", "Purchase Price", "Asset Type"]
     assert out.loc[0, "Asset Type"] == "Stock/ETF"
+
+
+# --------------------------------------------------------------------------- #
+# Buy-only cash allocation (no sells)
+# --------------------------------------------------------------------------- #
+def test_buy_only_never_requires_a_sell(inputs):
+    mu, cov = inputs
+    current_values = {"AAA": 6_000.0, "BBB": 3_000.0}  # CCC unheld; +1k new cash
+    total = 10_000.0
+    point = buy_only_max_sharpe(mu, cov, current_values, total, 0.02, max_weight=1.0)
+    assert point is not None
+    # Every existing holding's target value must be >= its current value.
+    for ticker, cur_val in current_values.items():
+        assert point.weights.get(ticker, 0.0) * total >= cur_val - 1e-6
+
+
+def test_buy_only_reallocation_has_no_sells(inputs):
+    mu, _ = inputs
+    latest = pd.Series({"AAA": 100.0, "BBB": 100.0, "CCC": 50.0})
+    current_values = {"AAA": 8_000.0, "BBB": 1_000.0}  # AAA over-weight
+    target = {"AAA": 0.30, "BBB": 0.30, "CCC": 0.40}   # would normally sell AAA
+    res = reallocation_plan(current_values, target, 12_000.0, latest, mu=mu,
+                            allow_fractional=False, buy_only=True)
+    assert "SELL" not in set(res.table["Action"])
+    assert res.total_tax == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Smart knapsack residual-cash rounding
+# --------------------------------------------------------------------------- #
+def test_knapsack_reduces_residual_and_tracking_error():
+    latest = pd.Series({"A": 10.0, "B": 12.0, "C": 8.0})
+    target = {"A": 1 / 3, "B": 1 / 3, "C": 1 / 3}
+    naive = reallocation_plan({}, target, 10_000.0, latest, allow_fractional=False,
+                              smart_rounding=False)
+    smart = reallocation_plan({}, target, 10_000.0, latest, allow_fractional=False,
+                              smart_rounding=True)
+    assert smart.residual_cash < naive.residual_cash
+    assert smart.tracking_error <= naive.tracking_error + 1e-12
+
+
+# --------------------------------------------------------------------------- #
+# Macro-regime backtest transforms
+# --------------------------------------------------------------------------- #
+def test_regime_none_is_passthrough(prices):
+    assert apply_regime(prices, {}, "None / Live Lookback") is prices
+    assert apply_regime(prices, {}, None) is prices
+
+
+def test_gfc_regime_inflates_volatility(prices):
+    sectors = {"AAA": "Technology", "BBB": "Financial Services", "CCC": "Fixed Income"}
+    gfc = apply_regime(prices, sectors, "2008 Great Financial Crisis (GFC)")
+    assert gfc.shape == prices.shape
+    assert (gfc.to_numpy() > 0).all()
+    assert gfc.pct_change().std().mean() > prices.pct_change().std().mean()
+
+
+# --------------------------------------------------------------------------- #
+# IBKR symbol mapping
+# --------------------------------------------------------------------------- #
+def test_ibkr_symbol_mapping():
+    assert map_ibkr_symbol("VWCE.DE") == "VWCE"
+    assert map_ibkr_symbol("AGGH.MI") == "AGGH"
+    assert map_ibkr_symbol("AAPL") == "AAPL"
+    assert clean_ib_symbol("EMBE.MI") == "EMBE"
+    assert ibkr_exchange_for("VWCE.DE") == "IBIS"
+    assert ibkr_exchange_for("AGGH.MI") == "BVME"
+    assert ibkr_exchange_for("AAPL") == "SMART"
+
+
+# --------------------------------------------------------------------------- #
+# Hierarchical Risk Parity clustering
+# --------------------------------------------------------------------------- #
+def test_hierarchical_clusters(inputs):
+    _, cov = inputs
+    corr = optimizer.correlation_from_covariance(cov)
+    tree = hierarchical_clusters(corr)
+    assert tree is not None
+    assert set(tree.leaves) == {"AAA", "BBB", "CCC"}
+    assert len(tree.icoord) == len(tree.dcoord) == 2  # n-1 merges for 3 assets
+    # Fewer than 3 assets -> graceful None.
+    assert hierarchical_clusters(corr.iloc[:2, :2]) is None

@@ -349,9 +349,50 @@ class ReallocationResult:
     transaction_cost: float
     tolerance: float
     investable_capital: float
+    buy_only: bool = False
+    tracking_error: float = float("nan")
 
 
 _HOLD_TOLERANCE = "HOLD / Within Tolerance"
+
+
+def _knapsack_topup(
+    traded: dict[str, float],
+    cur: dict[str, float],
+    price: dict[str, float],
+    target_value: dict[str, float],
+    investable: float,
+    within_tol: dict[str, bool],
+    max_iter: int = 20_000,
+) -> None:
+    """Greedily deploy residual cash to minimise integer tracking error.
+
+    After whole-share rounding leaves uninvested cash, repeatedly buy one extra
+    share of whichever (affordable, non-locked) asset most reduces the squared
+    value-space tracking error to the continuous target — driving residual cash
+    toward zero. Mutates ``traded`` in place. Only ever *buys*.
+    """
+    new_val = {t: cur[t] + traded[t] * price[t] for t in traded}
+    residual = investable - sum(new_val.values())
+    if residual <= 0 or not any(price[t] > 0 for t in traded):
+        return
+
+    for _ in range(max_iter):
+        best, best_gain = None, 1e-12
+        for t in traded:
+            p = price[t]
+            if p <= 0 or p > residual + 1e-9 or within_tol[t]:
+                continue
+            before = (new_val[t] - target_value[t]) ** 2
+            after = (new_val[t] + p - target_value[t]) ** 2
+            gain = before - after
+            if gain > best_gain:
+                best_gain, best = gain, t
+        if best is None:
+            break
+        traded[best] += 1
+        new_val[best] += price[best]
+        residual -= price[best]
 
 
 def reallocation_plan(
@@ -366,100 +407,101 @@ def reallocation_plan(
     tolerance: float = 0.0,
     purchase_prices: dict[str, float] | None = None,
     asset_types: dict[str, str] | None = None,
+    buy_only: bool = False,
+    smart_rounding: bool = True,
 ) -> ReallocationResult:
     """Build a friction- and tax-aware reallocation plan.
 
     Parameters
     ----------
-    current_values:
-        Ticker -> current value held (empty for a new portfolio).
-    target_weights:
-        Target weights (e.g. the tangency portfolio).
-    investable_capital:
-        Capital the target weights apply to (active tranche capital).
-    latest_prices:
-        Latest close price per ticker, used to size trades in shares.
+    current_values, target_weights, investable_capital, latest_prices:
+        See the module docs. ``current_values`` may be empty (new portfolio).
     mu:
         Optional expected returns; enables gross/net achieved-return metrics.
     allow_fractional:
-        If ``False``, trades are truncated to whole shares (residual cash).
-    transaction_cost:
-        Flat cost per executed trade.
-    tolerance:
-        If ``|w_current - w_target| < tolerance`` the asset is flagged
-        ``"HOLD / Within Tolerance"`` and not traded (avoids needless friction).
-    purchase_prices:
-        Average cost basis per ticker; drives realised-gain tax on SELLs.
-    asset_types:
-        Ticker -> 'Stock/ETF' | 'Bond/Fixed Income' for the Italian tax rate.
+        If ``False``, trades are whole shares; with ``smart_rounding`` the
+        residual cash is then knapsack-deployed to cut integer tracking error.
+    transaction_cost, tolerance, purchase_prices, asset_types:
+        Friction, the rebalancing tolerance band and Italian-tax inputs.
+    buy_only:
+        If ``True``, any computed SELL is suppressed (held) so the plan deploys
+        new cash without realising gains — pairs with ``buy_only_max_sharpe``.
+    smart_rounding:
+        Enable the knapsack residual-cash top-up (whole-share mode only).
     """
     purchase_prices = purchase_prices or {}
     asset_types = asset_types or {}
     tickers = sorted(set(current_values) | set(target_weights))
+
+    cur = {t: float(current_values.get(t, 0.0) or 0.0) for t in tickers}
+    price = {t: float(latest_prices.get(t, 0.0) or 0.0) for t in tickers}
+    tgt_w = {t: float(target_weights.get(t, 0.0)) for t in tickers}
+    cur_w = {t: (cur[t] / investable_capital if investable_capital > 0 else 0.0)
+             for t in tickers}
+    target_value = {t: tgt_w[t] * investable_capital for t in tickers}
+    within_tol = {t: abs(tgt_w[t] - cur_w[t]) < tolerance for t in tickers}
+
+    # ---- 1. Base integer/fractional trades ----
+    traded: dict[str, float] = {}
+    for t in tickers:
+        if within_tol[t] or price[t] <= 0:
+            traded[t] = 0.0
+            continue
+        raw = (target_value[t] - cur[t]) / price[t]
+        if buy_only and raw < 0:          # suppress sells entirely
+            traded[t] = 0.0
+            continue
+        traded[t] = math.trunc(raw) if not allow_fractional else raw
+
+    # ---- 2. Smart knapsack residual-cash deployment (whole-share mode) ----
+    if not allow_fractional and smart_rounding:
+        _knapsack_topup(traded, cur, price, target_value, investable_capital, within_tol)
+
+    # ---- 3. Build the table + friction ----
     rows = []
     new_values: dict[str, float] = {}
     num_trades = 0
     total_tax = 0.0
-
-    for ticker in tickers:
-        cur_val = float(current_values.get(ticker, 0.0) or 0.0)
-        tgt_w = float(target_weights.get(ticker, 0.0))
-        cur_w = cur_val / investable_capital if investable_capital > 0 else 0.0
-        delta_w = tgt_w - cur_w
-        price = float(latest_prices.get(ticker, 0.0) or 0.0)
-
-        within_tol = abs(delta_w) < tolerance
-        if within_tol:
-            traded_shares: float = 0.0
-        else:
-            raw_shares = (tgt_w * investable_capital - cur_val) / price if price > 0 \
-                else float("nan")
-            traded_shares = math.trunc(raw_shares) if (not allow_fractional and price > 0) \
-                else raw_shares
-
-        executed_value = traded_shares * price if price > 0 else 0.0
-        new_value = cur_val + executed_value
-        new_values[ticker] = new_value
-
-        traded = (not within_tol) and price > 0 and abs(traded_shares) >= (
-            1 if not allow_fractional else 1e-9)
-        if traded:
+    for t in tickers:
+        shares = traded[t]
+        executed_value = shares * price[t] if price[t] > 0 else 0.0
+        new_values[t] = cur[t] + executed_value
+        is_trade = price[t] > 0 and abs(shares) >= (1 if not allow_fractional else 1e-9)
+        if is_trade:
             num_trades += 1
 
-        # Capital-gains tax only on the SOLD portion of a profitable position.
         tax = 0.0
-        if traded and traded_shares < 0:
-            pp = purchase_prices.get(ticker)
-            if pp and price > 0:
-                realised_gain = abs(traded_shares) * (price - float(pp))
-                tax = tax_rate_for(asset_types.get(ticker)) * max(realised_gain, 0.0)
+        if is_trade and shares < 0:        # tax the sold portion of a gain
+            pp = purchase_prices.get(t)
+            if pp and price[t] > 0:
+                realised_gain = abs(shares) * (price[t] - float(pp))
+                tax = tax_rate_for(asset_types.get(t)) * max(realised_gain, 0.0)
                 total_tax += tax
 
-        if within_tol:
+        if within_tol[t]:
             action = _HOLD_TOLERANCE
-        elif traded_shares > (0 if allow_fractional else 0.0) and traded:
+        elif is_trade and shares > 0:
             action = "BUY"
-        elif traded_shares < 0 and traded:
+        elif is_trade and shares < 0:
             action = "SELL"
         else:
             action = "HOLD"
 
         rows.append({
-            "Ticker": ticker,
-            "Current %": round(cur_w * 100, 2),
-            "Target %": round(tgt_w * 100, 2),
-            "Δ Weight %": round(delta_w * 100, 2),
-            "Price": round(price, 2) if price > 0 else None,
+            "Ticker": t,
+            "Current %": round(cur_w[t] * 100, 2),
+            "Target %": round(tgt_w[t] * 100, 2),
+            "Δ Weight %": round((tgt_w[t] - cur_w[t]) * 100, 2),
+            "Price": round(price[t], 2) if price[t] > 0 else None,
             "Shares to trade": (
-                int(traded_shares) if (not allow_fractional and price > 0)
-                else (round(traded_shares, 4) if price > 0 else None)),
-            "Trade Value": round(executed_value, 2) if price > 0 else None,
+                int(shares) if (not allow_fractional and price[t] > 0)
+                else (round(shares, 4) if price[t] > 0 else None)),
+            "Trade Value": round(executed_value, 2) if price[t] > 0 else None,
             "Cap-Gains Tax": round(tax, 2),
             "Action": action,
         })
 
     table = pd.DataFrame(rows)
-
     deployed = sum(new_values.values())
     residual_cash = max(investable_capital - deployed, 0.0)
     total_fees = transaction_cost * num_trades
@@ -473,6 +515,12 @@ def reallocation_plan(
             w * float(mu.get(t, 0.0)) for t, w in achieved_weights.items()))
     else:
         gross_return = float("nan")
+
+    # Tracking error in value-weight space (consistent with the knapsack
+    # objective): how far the deployed value vector sits from the target weights.
+    tracking_error = float(np.sqrt(sum(
+        (new_values[t] / investable_capital - tgt_w[t]) ** 2 for t in tickers))) \
+        if investable_capital > 0 else float("nan")
 
     friction_drag = (total_friction / investable_capital) if investable_capital > 0 else 0.0
     net_return = gross_return - friction_drag if not math.isnan(gross_return) else float("nan")
@@ -491,6 +539,8 @@ def reallocation_plan(
         transaction_cost=transaction_cost,
         tolerance=tolerance,
         investable_capital=investable_capital,
+        buy_only=buy_only,
+        tracking_error=tracking_error,
     )
 
 
@@ -633,9 +683,45 @@ def classify_noise(current: "CurrentPortfolio", cov: pd.DataFrame) -> NoiseRepor
 # --------------------------------------------------------------------------- #
 # Institutional execution export (IBKR TWS Basket Trader + config sheet)
 # --------------------------------------------------------------------------- #
+# Yahoo exchange suffix -> Interactive Brokers exchange (context, not exported).
+_IBKR_EXCHANGE_BY_SUFFIX: dict[str, str] = {
+    "DE": "IBIS",   # Xetra
+    "MI": "BVME",   # Borsa Italiana
+    "AS": "AEB",    # Euronext Amsterdam
+    "PA": "SBF",    # Euronext Paris
+    "L": "LSE",     # London Stock Exchange
+    "SW": "EBS",    # SIX Swiss
+    "TO": "TSE",    # Toronto
+    "HK": "SEHK",   # Hong Kong
+    "T": "TSEJ",    # Tokyo
+}
+# Explicit overrides for symbols whose IB root differs from the Yahoo base.
+_IBKR_SYMBOL_OVERRIDES: dict[str, str] = {}
+
+
+def map_ibkr_symbol(ticker: str) -> str:
+    """Translate a Yahoo ticker to the clean IB Basket-Trader ``Symbol`` root.
+
+    ``VWCE.DE`` -> ``VWCE`` (Xetra), ``AGGH.MI`` -> ``AGGH`` (Borsa Italiana),
+    plain US tickers pass through unchanged. Explicit overrides take precedence.
+    """
+    sym = str(ticker).strip().upper()
+    if sym in _IBKR_SYMBOL_OVERRIDES:
+        return _IBKR_SYMBOL_OVERRIDES[sym]
+    return sym.split(".")[0]
+
+
+def ibkr_exchange_for(ticker: str) -> str:
+    """Return the IB exchange code implied by a Yahoo suffix (``"SMART"`` if US)."""
+    parts = str(ticker).strip().upper().rsplit(".", 1)
+    if len(parts) == 2:
+        return _IBKR_EXCHANGE_BY_SUFFIX.get(parts[1], "SMART")
+    return "SMART"
+
+
 def clean_ib_symbol(ticker: str) -> str:
-    """Strip the Yahoo exchange suffix (``.DE``/``.MI`` …) for IB compatibility."""
-    return str(ticker).upper().split(".")[0]
+    """Backwards-compatible alias for :func:`map_ibkr_symbol`."""
+    return map_ibkr_symbol(ticker)
 
 
 def basket_trader_csv(realloc: ReallocationResult) -> str:
@@ -656,7 +742,7 @@ def basket_trader_csv(realloc: ReallocationResult) -> str:
         rows.append({
             "Action": action,
             "Quantity": qty,
-            "Symbol": clean_ib_symbol(row["Ticker"]),
+            "Symbol": map_ibkr_symbol(row["Ticker"]),
             "OrderType": "MKT",
         })
     frame = pd.DataFrame(rows, columns=["Action", "Quantity", "Symbol", "OrderType"])
@@ -687,6 +773,49 @@ def portfolio_config_csv(
             f"Target Value ({base_currency})": round(tgt_w * investable_capital, 2),
         })
     return pd.DataFrame(rows).to_csv(index=False)
+
+
+# --------------------------------------------------------------------------- #
+# Hierarchical Risk Parity — correlation cluster tree
+# --------------------------------------------------------------------------- #
+@dataclass
+class ClusterTree:
+    """Dendrogram plotting data from agglomerative clustering of a correlation
+    matrix (Hierarchical Risk Parity distance)."""
+
+    icoord: list[list[float]]
+    dcoord: list[list[float]]
+    leaves: list[str]
+    labels: list[str]
+    linkage_matrix: np.ndarray
+
+
+def hierarchical_clusters(corr: pd.DataFrame, method: str = "single") -> ClusterTree | None:
+    """Agglomerative clustering of the correlation matrix for an HRP dendrogram.
+
+    Uses the standard HRP distance ``d = sqrt(0.5 * (1 - ρ))``. Returns ``None``
+    (graceful degradation) for fewer than three assets or any numerical failure
+    (singular matrix, scipy import error, …).
+    """
+    try:
+        from scipy.cluster.hierarchy import dendrogram, linkage
+        from scipy.spatial.distance import squareform
+
+        labels = [str(c) for c in corr.columns]
+        if len(labels) < 3:
+            return None
+        rho = np.clip(corr.to_numpy(dtype=float), -1.0, 1.0)
+        dist = np.sqrt(np.clip(0.5 * (1.0 - rho), 0.0, None))
+        dist = (dist + dist.T) / 2.0
+        np.fill_diagonal(dist, 0.0)
+        condensed = squareform(dist, checks=False)
+        link = linkage(condensed, method=method)
+        ddata = dendrogram(link, labels=labels, no_plot=True)
+        return ClusterTree(
+            icoord=ddata["icoord"], dcoord=ddata["dcoord"],
+            leaves=list(ddata["ivl"]), labels=labels, linkage_matrix=link)
+    except Exception:  # noqa: BLE001 - degrade gracefully on any clustering failure
+        return None
 
 
 # --------------------------------------------------------------------------- #

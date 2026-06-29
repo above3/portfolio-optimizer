@@ -19,7 +19,12 @@ import pandas as pd
 import streamlit as st
 
 from src import config
-from src.data_loader import PriceDataError, fetch_price_history, fetch_risk_free_rate
+from src.data_loader import (
+    PriceDataError,
+    apply_regime,
+    fetch_price_history,
+    fetch_risk_free_rate,
+)
 from src.optimizer import (
     AnchorConstraint,
     FrontierResult,
@@ -27,6 +32,7 @@ from src.optimizer import (
     WatchlistRecommendation,
     analyse,
     backtest_equity_curves,
+    buy_only_max_sharpe,
     screen_watchlist,
     simulate_gbm_wealth,
 )
@@ -38,6 +44,7 @@ from src.portfolio import (
     build_current_portfolio,
     classify_noise,
     deployment_plan,
+    hierarchical_clusters,
     normalise_holdings_df,
     parse_ibkr_positions,
     portfolio_config_csv,
@@ -47,6 +54,7 @@ from src.sample_data import generate_sample_prices, load_prices_from_csv
 from src.visualization import (
     backtest_figure,
     correlation_heatmap,
+    dendrogram_figure,
     efficient_frontier_figure,
     gbm_fan_chart,
 )
@@ -167,9 +175,11 @@ _SETTING_DEFAULTS: dict[str, object] = {
     "pc_capital": 0.0,
     "pc_deployment": config.DEPLOYMENT_STRATEGIES[0],
     "pc_tranches": config.DEFAULT_TRANCHES,
+    "pc_buy_only": False,
     "pc_horizon": config.DEFAULT_HORIZON_YEARS,
     "pc_nsim": config.DEFAULT_N_SIMULATIONS,
     "pc_watchlist": config.DEFAULT_WATCHLIST,
+    "pc_regime": config.MACRO_REGIMES[0],
 }
 _SETTING_OPTIONS: dict[str, tuple] = {
     "pc_currency": tuple(config.BASE_CURRENCIES),
@@ -178,6 +188,7 @@ _SETTING_OPTIONS: dict[str, tuple] = {
     "pc_returns": tuple(config.RETURNS_MODELS),
     "pc_cov": tuple(config.COVARIANCE_METHODS),
     "pc_deployment": tuple(config.DEPLOYMENT_STRATEGIES),
+    "pc_regime": tuple(config.MACRO_REGIMES),
 }
 
 
@@ -374,6 +385,10 @@ def render_sidebar() -> dict:
                                      key="pc_tranches")
     else:
         tranches = int(st.session_state.get("pc_tranches", config.DEFAULT_TRANCHES))
+    buy_only = st.sidebar.toggle(
+        "Optimize Using New Capital Only (No Sells)", key="pc_buy_only",
+        help="Deploy only the new tranche cash to drift toward the Max-Sharpe "
+             "target without selling — eliminates capital-gains tax and sell fees.")
 
     st.sidebar.markdown("### 🎲 Projection & simulation")
     horizon_years = st.sidebar.slider("Investment Horizon (Years)",
@@ -398,6 +413,7 @@ def render_sidebar() -> dict:
         "tolerance": tolerance_pct / 100.0, "allow_fractional": not disable_fractional,
         "transaction_cost": float(transaction_cost), "capital": float(capital),
         "deployment_strategy": deployment_strategy, "tranches": int(tranches),
+        "buy_only": bool(buy_only),
         "horizon_years": int(horizon_years), "n_simulations": int(n_sim),
     }
 
@@ -583,8 +599,12 @@ def _deployment_metrics(deployment, ccy: str) -> None:
 
 
 def _render_reallocation(target: PortfolioPoint, current, deployment, latest_prices,
-                         mu, params, asset_types, sectors, ccy, key_prefix: str) -> None:
+                         mu, params, asset_types, sectors, ccy, key_prefix: str,
+                         buy_only: bool = False) -> None:
     sym = _sym(ccy)
+    if buy_only:
+        st.success("🛒 **Buy-Only mode** — deploying new cash without selling "
+                   "(zero capital-gains tax, zero sell-side fees).")
     left, right = st.columns([1, 1.7])
     with left:
         st.markdown("**Target weights**")
@@ -597,8 +617,12 @@ def _render_reallocation(target: PortfolioPoint, current, deployment, latest_pri
             latest_prices=latest_prices, mu=mu, risk_free_rate=params["risk_free_rate"],
             allow_fractional=params["allow_fractional"], transaction_cost=params["transaction_cost"],
             tolerance=params["tolerance"], purchase_prices=current.purchase_prices if current else {},
-            asset_types=asset_types)
+            asset_types=asset_types, buy_only=buy_only, smart_rounding=True)
         st.dataframe(res.table, hide_index=True, use_container_width=True)
+        if not params["allow_fractional"]:
+            st.caption(f"🧩 Smart knapsack rounding · residual cash "
+                       f"{sym}{res.residual_cash:,.2f} · integer tracking error "
+                       f"{res.tracking_error:.4f}.")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Trades", res.num_trades)
@@ -666,8 +690,12 @@ def _render_watchlist(base_sharpe, recommendations, anchor_ticker) -> None:
 # Backtest & Monte-Carlo tabs
 # --------------------------------------------------------------------------- #
 def _render_backtest(prices, base_pool, current, result, benchmark_prices,
-                     benchmark_ticker, risk_free_rate) -> None:
+                     benchmark_ticker, risk_free_rate, sectors) -> None:
     st.subheader("Historical Backtest Analysis")
+    regime = st.selectbox("Historical Macro Regime Backtest Simulation",
+                          config.MACRO_REGIMES, key="pc_regime",
+                          help="Stress-test current vs optimised allocations against "
+                               "synthetic shock regimes scaled from historical proxies.")
     weight_sets: dict[str, dict] = {}
     if current is not None:
         weight_sets["Current Portfolio"] = current.weights
@@ -676,10 +704,27 @@ def _render_backtest(prices, base_pool, current, result, benchmark_prices,
     if not weight_sets:
         st.info("Need a current and/or optimised portfolio to backtest.")
         return
-    bt = backtest_equity_curves(prices[base_pool], weight_sets, risk_free_rate,
-                                benchmark_prices=benchmark_prices, benchmark_name=benchmark_ticker)
+
+    # Apply the regime shock (graceful fallback to live lookback on failure).
+    panel = prices[base_pool]
+    bt_prices = apply_regime(panel, sectors, regime)
+    bench = benchmark_prices
+    if benchmark_prices is not None and benchmark_ticker:
+        bench_sectors = {benchmark_ticker: sectors.get(benchmark_ticker, "Diversified ETF")}
+        bench = apply_regime(benchmark_prices.to_frame(name=benchmark_ticker),
+                             bench_sectors, regime)[benchmark_ticker]
+    if not regime.startswith("None"):
+        if bt_prices is panel:
+            st.warning("⚠️ Regime transform failed (singular/degenerate) — "
+                       "reverted to the live lookback.")
+        else:
+            st.info(f"🌐 Simulating **{regime}** — synthetic shock scaled from "
+                    "historical proxy covariance & drift shifts.")
+
+    bt = backtest_equity_curves(bt_prices, weight_sets, risk_free_rate,
+                                benchmark_prices=bench, benchmark_name=benchmark_ticker)
     st.plotly_chart(backtest_figure(bt), use_container_width=True)
-    st.markdown("**Diagnostics** (frozen weights over the lookback window)")
+    st.markdown("**Diagnostics** (frozen weights over the window)")
     st.dataframe(bt.diagnostics, use_container_width=True)
 
 
@@ -750,8 +795,23 @@ def render_results(result, current, noise, deployment, data, params,
             if result.tangency is None:
                 st.warning("Tangency portfolio unavailable at the current Rf.")
             else:
-                _render_reallocation(result.tangency, current, deployment, latest_prices,
-                                     result.mu, params, asset_types, result.sector_map, ccy, "tan")
+                # Buy-Only: re-solve the no-sell target reachable with new cash.
+                use_buy_only = (params["buy_only"] and current is not None
+                                and deployment.additional_cash > 0)
+                target = result.tangency
+                if use_buy_only:
+                    bo = buy_only_max_sharpe(
+                        result.mu, result.cov, current.values, deployment.active_capital,
+                        params["risk_free_rate"], result.max_weight,
+                        result.sector_map, result.sector_max)
+                    if bo is not None:
+                        target = bo
+                    else:
+                        use_buy_only = False
+                        st.warning("No feasible buy-only target; showing standard rebalance.")
+                _render_reallocation(target, current, deployment, latest_prices,
+                                     result.mu, params, asset_types, result.sector_map,
+                                     ccy, "tan", buy_only=use_buy_only)
         with tab_mvp:
             _render_reallocation(result.mvp, current, deployment, latest_prices,
                                  result.mu, params, asset_types, result.sector_map, ccy, "mvp")
@@ -762,13 +822,22 @@ def render_results(result, current, noise, deployment, data, params,
             _render_watchlist(base_sharpe, recs, anchor_ticker)
 
         st.markdown("---")
-        st.subheader("Diversification — correlation matrix")
-        st.plotly_chart(correlation_heatmap(result.corr), use_container_width=True)
+        st.subheader("Diversification — correlation & risk clustering")
+        col_heat, col_tree = st.columns(2)
+        with col_heat:
+            st.plotly_chart(correlation_heatmap(result.corr), use_container_width=True)
+        with col_tree:
+            tree = hierarchical_clusters(result.corr)
+            if tree is None:
+                st.warning("⚠️ Hierarchical clustering needs ≥3 assets (or the matrix "
+                           "was singular). Showing the heatmap only.")
+            else:
+                st.plotly_chart(dendrogram_figure(tree), use_container_width=True)
 
     with tab_bt:
         _render_backtest(data["prices"], list(result.mu.index), current, result,
                          data["benchmark_prices"], data["benchmark_ticker"],
-                         params["risk_free_rate"])
+                         params["risk_free_rate"], data.get("sectors", {}))
 
     with tab_mc:
         _render_montecarlo(result, deployment, params, ccy)

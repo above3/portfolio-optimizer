@@ -12,7 +12,12 @@ from dataclasses import dataclass, field
 import pandas as pd
 import yfinance as yf
 
-from .config import DEFAULT_LOOKBACK_YEARS, RISK_FREE_TICKER, UNKNOWN_SECTOR
+from .config import (
+    DEFAULT_LOOKBACK_YEARS,
+    RISK_FREE_TICKER,
+    TRADING_DAYS_PER_YEAR,
+    UNKNOWN_SECTOR,
+)
 
 
 class PriceDataError(RuntimeError):
@@ -342,3 +347,89 @@ def fetch_price_history(
         base_currency=base_currency,
         notes=notes,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Macro-regime backtest shocks (synthetic transformation of price arrays)
+# --------------------------------------------------------------------------- #
+def _regime_category(sector: str | None) -> str:
+    """Map a sector label to a coarse regime-sensitivity bucket."""
+    s = (sector or "").lower()
+    if "tech" in s:
+        return "growth"
+    if "financ" in s or "energy" in s:
+        return "value"
+    if "fixed" in s or "bond" in s:
+        return "bond"
+    if "commodit" in s or "gold" in s:
+        return "commodity"
+    if "etf" in s or "divers" in s or "market" in s:
+        return "market"
+    return "other"
+
+
+# Per-regime, per-category: (annual_drift_shift, vol_multiplier, systemic_load).
+# ``systemic_load`` adds a shared market-shock factor, inflating covariance.
+_REGIME_PARAMS: dict[str, dict[str, tuple[float, float, float]]] = {
+    "2022 Stagflation Regime": {
+        "growth": (-0.28, 1.35, 0.10), "value": (0.08, 1.20, 0.10),
+        "commodity": (0.18, 1.30, 0.05), "bond": (-0.06, 1.10, 0.05),
+        "market": (-0.12, 1.25, 0.15), "other": (-0.10, 1.20, 0.10),
+    },
+    "2008 Great Financial Crisis (GFC)": {
+        "growth": (-0.48, 2.00, 0.45), "value": (-0.52, 2.10, 0.50),
+        "commodity": (-0.30, 1.80, 0.35), "bond": (0.06, 1.20, 0.10),
+        "market": (-0.45, 2.00, 0.50), "other": (-0.45, 2.00, 0.45),
+    },
+    "2000 Dot-Com Bubble Burst": {
+        "growth": (-0.55, 1.90, 0.30), "value": (-0.05, 1.20, 0.10),
+        "commodity": (0.02, 1.10, 0.05), "bond": (0.05, 1.00, 0.05),
+        "market": (-0.20, 1.40, 0.20), "other": (-0.15, 1.30, 0.15),
+    },
+}
+
+
+def apply_regime(
+    prices: pd.DataFrame,
+    sectors: dict[str, str] | None,
+    regime: str | None,
+) -> pd.DataFrame:
+    """Transform a price panel to emulate a historical macro regime.
+
+    Daily returns are de-meaned, then per asset re-drifted, volatility-scaled and
+    loaded onto a shared systemic shock (covariance spike) according to the
+    sector-specific parameters of the selected regime. Returns the original panel
+    unchanged for the live lookback or on any numerical failure (graceful
+    degradation), so the backtest never crashes on a singular transform.
+    """
+    if not regime or regime.startswith("None"):
+        return prices
+    params = _REGIME_PARAMS.get(regime)
+    if params is None:
+        return prices
+    try:
+        rets = prices.pct_change().dropna(how="all")
+        if rets.shape[0] < 2:
+            return prices
+        demeaned = rets - rets.mean()
+        systemic = demeaned.mean(axis=1)  # proxy market-shock factor
+
+        shocked: dict[str, pd.Series] = {}
+        for ticker in prices.columns:
+            cat = _regime_category((sectors or {}).get(ticker, ""))
+            drift, vol_mult, load = params.get(cat, params["other"])
+            shocked[ticker] = (drift / TRADING_DAYS_PER_YEAR
+                               + vol_mult * demeaned[ticker]
+                               + load * systemic)
+        new_rets = pd.DataFrame(shocked, index=rets.index)
+
+        first = prices.iloc[0]
+        path = (1.0 + new_rets).cumprod().mul(first, axis=1)
+        first_row = first.to_frame().T
+        first_row.index = [prices.index[0]]
+        out = pd.concat([first_row, path])
+        if out.isna().to_numpy().any() or (out <= 0).to_numpy().any():
+            return prices
+        return out
+    except Exception:  # noqa: BLE001 - any failure -> baseline lookback
+        return prices

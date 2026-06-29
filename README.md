@@ -49,6 +49,11 @@ Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 | **Local persistence** (auto-save holdings/settings) | `portfolio.PortfolioStore` (SQLite) |
 | **Premium dark-mode UI** + neon metric cards | `app.py` (CSS injection) |
 | **Optional password gate** | `app.py` (`st.secrets`) |
+| **Buy-only cash allocation** (no-sell rebalancing) | `optimizer.buy_only_max_sharpe` |
+| **Smart knapsack residual-cash rounding** | `portfolio.reallocation_plan` |
+| **Macro-regime backtests** (2022/2008/2000 shocks) | `data_loader.apply_regime` |
+| **IBKR suffix mapping** (`.DE`/`.MI` → clean root) | `portfolio.map_ibkr_symbol` |
+| **HRP correlation cluster dendrogram** | `portfolio.hierarchical_clusters` |
 
 The chart shows the feasible-set cloud coloured by Sharpe ratio, the efficient
 frontier, the CML, the risk-free point, and star/diamond markers for the MVP,

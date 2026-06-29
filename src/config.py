@@ -64,6 +64,14 @@ DEFAULT_TRANCHES: int = 4
 TRANCHE_MIN: int = 2
 TRANCHE_MAX: int = 24
 
+# ---- Macro-regime backtest scenarios ------------------------------------- #
+MACRO_REGIMES: tuple[str, ...] = (
+    "None / Live Lookback",
+    "2022 Stagflation Regime",
+    "2008 Great Financial Crisis (GFC)",
+    "2000 Dot-Com Bubble Burst",
+)
+
 # ---- GBM Monte-Carlo wealth projection ----------------------------------- #
 DEFAULT_HORIZON_YEARS: int = 15
 HORIZON_MIN_YEARS: int = 1

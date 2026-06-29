@@ -13,7 +13,7 @@ import numpy as np
 import plotly.graph_objects as go
 
 from .optimizer import BacktestResult, FrontierResult, PortfolioPoint, WealthProjection
-from .portfolio import CurrentPortfolio
+from .portfolio import ClusterTree, CurrentPortfolio
 
 
 def _weights_hover(weights: dict[str, float], top: int = 8) -> str:
@@ -282,4 +282,25 @@ def gbm_fan_chart(projection: WealthProjection, currency_symbol: str = "$") -> g
         template="plotly_white", height=520, hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
+    return fig
+
+
+def dendrogram_figure(tree: ClusterTree) -> go.Figure:
+    """Plotly Hierarchical Risk Parity dendrogram from a :class:`ClusterTree`.
+
+    Assets that merge low (short vertical links) share systemic structural risk
+    — an instant visual warning of hidden sector concentration.
+    """
+    fig = go.Figure()
+    for xs, ys in zip(tree.icoord, tree.dcoord):
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", line=dict(color="#1f77b4", width=2),
+            hoverinfo="skip", showlegend=False))
+    tickvals = [5.0 + 10.0 * i for i in range(len(tree.leaves))]
+    fig.update_xaxes(tickvals=tickvals, ticktext=tree.leaves, tickangle=-30)
+    fig.update_layout(
+        title="Hierarchical Risk Clustering Dendrogram — tight branches = shared risk",
+        xaxis_title="Holdings grouped by shared systemic risk",
+        yaxis_title="Cluster distance √(½(1−ρ))",
+        template="plotly_white", height=440)
     return fig
