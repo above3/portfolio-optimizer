@@ -21,6 +21,13 @@ DEFAULT_BENCHMARK: str = "SPY"
 # Maximum allocation per asset (as a decimal). 1.0 == no concentration cap.
 DEFAULT_MAX_WEIGHT: float = 1.0
 
+# ---- Data architecture (provider framework) ------------------------------ #
+ARCH_YAHOO: str = "Yahoo Finance (Decoupled/Offline-Safe)"
+ARCH_IBKR: str = "Interactive Brokers Live API (TWS/Gateway Required)"
+DATA_ARCHITECTURES: tuple[str, ...] = (ARCH_YAHOO, ARCH_IBKR)
+# Native broker sockets on localhost.
+IBKR_PORT_CHOICES: dict[str, int] = {"TWS (7496)": 7496, "IB Gateway (4001)": 4001}
+
 # Core "global anchor" All-World ETF auto-injected into the universe.
 ANCHOR_TICKER: str = "VWCE.DE"
 DEFAULT_ANCHOR_PCT: int = 20          # default slider value (%)

@@ -683,3 +683,99 @@ def test_hierarchical_clusters(inputs):
     assert len(tree.icoord) == len(tree.dcoord) == 2  # n-1 merges for 3 assets
     # Fewer than 3 assets -> graceful None.
     assert hierarchical_clusters(corr.iloc[:2, :2]) is None
+
+
+# --------------------------------------------------------------------------- #
+# Abstract DataProvider framework
+# --------------------------------------------------------------------------- #
+def test_base_provider_is_abstract():
+    from src.providers import BaseDataProvider
+    with pytest.raises(TypeError):
+        BaseDataProvider()  # cannot instantiate the ABC
+
+
+def test_providers_implement_interface():
+    from src.providers import (BaseDataProvider, IBKRNativeProvider,
+                               YahooFinanceProvider, get_provider)
+    assert issubclass(YahooFinanceProvider, BaseDataProvider)
+    assert issubclass(IBKRNativeProvider, BaseDataProvider)
+    assert isinstance(get_provider("Yahoo Finance (Decoupled/Offline-Safe)"),
+                      YahooFinanceProvider)
+    assert isinstance(get_provider("Interactive Brokers Live API"), IBKRNativeProvider)
+
+
+def test_ibkr_connect_degrades_without_ib_insync():
+    """ib_insync is absent in the sandbox -> connect raises ProviderError."""
+    from src.providers import IBKRNativeProvider, ProviderError
+    provider = IBKRNativeProvider(port=7496)
+    assert provider.is_connected() is False
+    with pytest.raises(ProviderError):
+        provider.connect()
+    assert provider.is_connected() is False
+
+
+def test_positions_to_holdings_df_and_asset_type():
+    from src.portfolio import positions_to_holdings_df
+    from src.providers import Position
+    positions = [Position("AAPL", 10, 175.0, "USD", "STK"),
+                 Position("AGGH.MI", 30, 4.7, "EUR", "BOND"),
+                 Position("CASHZERO", 0, 0.0, "USD", "STK")]  # dropped
+    df = positions_to_holdings_df(positions).set_index("Ticker")
+    assert "CASHZERO" not in df.index
+    assert df.loc["AAPL", "Shares"] == 10
+    assert df.loc["AGGH.MI", "Asset Type"] == "Bond/Fixed Income"  # secType BOND
+
+
+def test_merge_holdings_preserves_manual_rows():
+    from src.portfolio import merge_holdings
+    live = pd.DataFrame([{"Ticker": "AAPL", "Shares": 10, "Purchase Price": 175.0,
+                          "Asset Type": "Stock/ETF"}])
+    manual = pd.DataFrame([
+        {"Ticker": "AAPL", "Shares": 99, "Purchase Price": 1.0, "Asset Type": "Stock/ETF"},
+        {"Ticker": "VWCE.DE", "Shares": 5, "Purchase Price": 98.0, "Asset Type": "Stock/ETF"}])
+    merged = merge_holdings(live, manual).set_index("Ticker")
+    # Live wins on the overlapping ticker; the manual-only row is preserved.
+    assert merged.loc["AAPL", "Shares"] == 10
+    assert "VWCE.DE" in merged.index
+
+
+def test_build_price_data_offline_with_supplied_metadata():
+    from src.data_loader import build_price_data
+    idx = pd.bdate_range("2021-01-01", periods=120)
+    close = pd.DataFrame({"AAA": np.linspace(100, 130, 120),
+                          "BBB": np.linspace(50, 70, 120)}, index=idx)
+    pdata = build_price_data(close, ["AAA", "BBB"], None, None,
+                             currencies={"AAA": "USD", "BBB": "USD"},
+                             sectors={"AAA": "Tech", "BBB": "Bond"})
+    assert pdata.valid_tickers == ["AAA", "BBB"]
+    assert pdata.sectors["BBB"] == "Bond"
+    assert pdata.base_currency is None
+
+
+def test_mock_ibkr_provider_pipeline():
+    """A mocked IBKR provider integrates through the standard PriceData path."""
+    from src.data_loader import build_price_data
+    from src.providers import AccountSnapshot, IBKRNativeProvider, Position
+
+    idx = pd.bdate_range("2021-01-01", periods=300)
+    close = pd.DataFrame({"AAPL": np.linspace(100, 180, 300),
+                          "MSFT": np.linspace(200, 320, 300)}, index=idx)
+    fake = build_price_data(close, ["AAPL", "MSFT"], None, None,
+                            currencies={"AAPL": "USD", "MSFT": "USD"},
+                            sectors={"AAPL": "Tech", "MSFT": "Tech"})
+
+    class MockIBKR(IBKRNativeProvider):
+        def is_connected(self):  # pretend the socket is live
+            return True
+        def fetch_historical_prices(self, tickers, lookback_years=5, benchmark=None,
+                                    base_currency=None):
+            return fake
+        def fetch_account_snapshot(self):
+            return AccountSnapshot("U999999", "USD", 12_345.0,
+                                   [Position("AAPL", 10, 150.0, "USD", "STK")])
+
+    mock = MockIBKR()
+    snap = mock.fetch_account_snapshot()
+    assert snap.account_id == "U999999" and snap.cash == 12_345.0
+    data = mock.fetch_historical_prices(["AAPL", "MSFT"])
+    assert list(data.prices.columns) == ["AAPL", "MSFT"]

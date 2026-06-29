@@ -972,3 +972,72 @@ def normalise_holdings_df(df: pd.DataFrame) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = "" if col == "Ticker" else 0.0
     return out[list(HOLDINGS_COLUMNS)]
+
+
+# --------------------------------------------------------------------------- #
+# Live-broker positions -> editable holdings (hybrid append-merge)
+# --------------------------------------------------------------------------- #
+def positions_to_holdings_df(positions) -> pd.DataFrame:
+    """Convert live broker positions into the editable holdings schema.
+
+    ``positions`` is any iterable of objects exposing ``symbol``/``shares``/
+    ``avg_cost``/``asset_type`` attributes (e.g. ``src.providers.Position``) or
+    equivalent dicts. Zero-share lots are dropped.
+    """
+    rows = []
+    for pos in positions or []:
+        if isinstance(pos, dict):
+            sym = pos.get("symbol", pos.get("Ticker", ""))
+            shares = pos.get("shares", pos.get("Shares", 0))
+            avg = pos.get("avg_cost", pos.get("Purchase Price"))
+            atype = pos.get("asset_type", pos.get("Asset Type"))
+        else:
+            sym = getattr(pos, "symbol", "")
+            shares = getattr(pos, "shares", 0)
+            avg = getattr(pos, "avg_cost", None)
+            atype = getattr(pos, "asset_type", None)
+        sym = str(sym or "").strip().upper()
+        if not sym:
+            continue
+        try:
+            shares = float(shares or 0)
+        except (TypeError, ValueError):
+            shares = 0.0
+        if shares == 0:
+            continue
+        try:
+            avg = float(avg) if avg not in (None, "") else None
+        except (TypeError, ValueError):
+            avg = None
+        rows.append({
+            "Ticker": sym,
+            "Shares": shares,
+            "Purchase Price": round(avg, 4) if avg else None,
+            "Asset Type": atype or guess_asset_type(sym),
+        })
+    return normalise_holdings_df(pd.DataFrame(rows, columns=list(HOLDINGS_COLUMNS)))
+
+
+def merge_holdings(primary: pd.DataFrame, secondary: pd.DataFrame) -> pd.DataFrame:
+    """Hybrid append-merge: ``primary`` rows first (and winning on conflicts),
+    then any ``secondary`` rows whose ticker is not already present.
+
+    Used to inject live IBKR positions (``primary``) while **preserving** the
+    user's manual rows (``secondary``) — never locking or discarding them.
+    """
+    def _norm(df):
+        if df is None or len(df) == 0:
+            return normalise_holdings_df(pd.DataFrame(columns=list(HOLDINGS_COLUMNS)))
+        return normalise_holdings_df(df)
+
+    primary, secondary = _norm(primary), _norm(secondary)
+    seen: set[str] = set()
+    rows: list[dict] = []
+    for frame in (primary, secondary):
+        for _, row in frame.iterrows():
+            ticker = str(row["Ticker"]).strip().upper()
+            if not ticker or ticker in seen:
+                continue
+            seen.add(ticker)
+            rows.append({c: row[c] for c in HOLDINGS_COLUMNS})
+    return normalise_holdings_df(pd.DataFrame(rows, columns=list(HOLDINGS_COLUMNS)))

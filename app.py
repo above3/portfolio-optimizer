@@ -45,11 +45,14 @@ from src.portfolio import (
     classify_noise,
     deployment_plan,
     hierarchical_clusters,
+    merge_holdings,
     normalise_holdings_df,
     parse_ibkr_positions,
     portfolio_config_csv,
+    positions_to_holdings_df,
     reallocation_plan,
 )
+from src.providers import DEFAULT_IBKR_CLIENT_ID, DEFAULT_IBKR_HOST, IBKRNativeProvider, ProviderError
 from src.sample_data import generate_sample_prices, load_prices_from_csv
 from src.visualization import (
     backtest_figure,
@@ -157,6 +160,8 @@ def _get_store() -> PortfolioStore:
 
 
 _SETTING_DEFAULTS: dict[str, object] = {
+    "pc_architecture": config.ARCH_YAHOO,
+    "pc_ibkr_port": next(iter(config.IBKR_PORT_CHOICES)),
     "pc_currency": config.DEFAULT_BASE_CURRENCY,
     "pc_data_source": "Yahoo Finance (live)",
     "pc_rf_live": True,
@@ -182,6 +187,8 @@ _SETTING_DEFAULTS: dict[str, object] = {
     "pc_regime": config.MACRO_REGIMES[0],
 }
 _SETTING_OPTIONS: dict[str, tuple] = {
+    "pc_architecture": tuple(config.DATA_ARCHITECTURES),
+    "pc_ibkr_port": tuple(config.IBKR_PORT_CHOICES),
     "pc_currency": tuple(config.BASE_CURRENCIES),
     "pc_data_source": ("Yahoo Finance (live)", "Sample data (offline)", "Upload CSV"),
     "pc_lookback": tuple(config.LOOKBACK_CHOICES),
@@ -256,6 +263,16 @@ def _make_anchor(ticker, weight, mode) -> AnchorConstraint | None:
     return AnchorConstraint(ticker=ticker, weight=weight, mode=mode) if ticker else None
 
 
+@st.cache_resource(show_spinner=False)
+def _connect_ibkr(host: str, port: int, client_id: int) -> IBKRNativeProvider:
+    """Cached live IBKR connection. Raises ProviderError if TWS/Gateway is down
+    or ib_insync is unavailable (cache_resource does not cache the exception, so
+    each rerun cleanly retries)."""
+    provider = IBKRNativeProvider(host=host, port=port, client_id=client_id)
+    provider.connect()
+    return provider
+
+
 @st.cache_data(show_spinner=False)
 def _run_analysis(prices, risk_free_rate, cov_method, n_simulations, max_weight,
                   returns_model, benchmark_prices, benchmark_ticker,
@@ -296,8 +313,28 @@ def _init_state() -> None:
             else normalise_holdings_df(pd.DataFrame(config.DEMO_PORTFOLIO)))
     st.session_state.setdefault("editor_version", 0)
     st.session_state.setdefault("ibkr_file_id", None)
+    st.session_state.setdefault("ibkr_ingest_id", None)
     st.session_state.setdefault("auto_run", False)
     _seed_settings(store)
+
+
+def _ingest_ibkr_positions(snapshot) -> None:
+    """Hybrid append-merge of live IBKR positions into the editable table.
+
+    Live rows are injected on top while existing manual rows are preserved
+    (never locked or discarded). Runs once per (account, position-count) so the
+    user can keep editing freely without being overwritten every rerun.
+    """
+    guard = f"{snapshot.account_id}:{len(snapshot.positions)}"
+    if st.session_state.get("ibkr_ingest_id") == guard:
+        return
+    live = positions_to_holdings_df(snapshot.positions)
+    if live.empty:
+        return
+    st.session_state.holdings_df = merge_holdings(live, st.session_state.holdings_df)
+    st.session_state.ibkr_ingest_id = guard
+    st.session_state.editor_version += 1
+    st.session_state.auto_run = True
 
 
 # --------------------------------------------------------------------------- #
@@ -319,21 +356,58 @@ def _risk_free_controls() -> float:
     return rf_pct / 100.0
 
 
+def _ibkr_connection_panel() -> tuple[bool, int]:
+    """Render the IBKR socket selector + live connection status.
+
+    Returns ``(ibkr_active, port)``. On any connection failure it cleanly falls
+    back to safe layout mode (``ibkr_active=False``) without losing manual rows.
+    """
+    port_label = st.sidebar.selectbox("Native socket", list(config.IBKR_PORT_CHOICES),
+                                      key="pc_ibkr_port")
+    port = config.IBKR_PORT_CHOICES[port_label]
+    st.session_state.pop("_ibkr_provider", None)
+    with st.spinner("Connecting to Local TWS/Gateway Socket…"):
+        try:
+            provider = _connect_ibkr(DEFAULT_IBKR_HOST, port, DEFAULT_IBKR_CLIENT_ID)
+            snapshot = provider.fetch_account_snapshot()
+        except ProviderError as exc:
+            st.sidebar.info(f"ℹ️ TWS not detected on {DEFAULT_IBKR_HOST}:{port}. "
+                            "Falling back to safe layout mode.")
+            st.sidebar.caption(f"({exc})")
+            return False, port
+    st.session_state["_ibkr_provider"] = provider
+    st.sidebar.success(f"🟢 Connected to Account: **{snapshot.account_id}** · "
+                       f"cash {_money(snapshot.cash, st.session_state.get('pc_currency'))}")
+    _ingest_ibkr_positions(snapshot)
+    return True, port
+
+
 def render_sidebar() -> dict:
     st.sidebar.header("⚙️ Parameters")
     st.sidebar.caption("💾 Settings & holdings auto-save to a local database.")
+
+    st.sidebar.markdown("### 🛰️ Active Data Architecture Source")
+    architecture = st.sidebar.radio("Engine", config.DATA_ARCHITECTURES,
+                                    key="pc_architecture", label_visibility="collapsed")
+    ibkr_active, ibkr_port = False, config.IBKR_PORT_CHOICES[next(iter(config.IBKR_PORT_CHOICES))]
+    if architecture == config.ARCH_IBKR:
+        ibkr_active, ibkr_port = _ibkr_connection_panel()
 
     base_currency = st.sidebar.selectbox(
         "Base Display Currency", options=config.BASE_CURRENCIES, key="pc_currency",
         help="All prices, values and P/L are normalised into this currency via "
              "live FX rates (graceful fallback to native currency on failure).")
 
-    data_source = st.sidebar.radio(
-        "Data source", ["Yahoo Finance (live)", "Sample data (offline)", "Upload CSV"],
-        key="pc_data_source", help="Live needs Yahoo Finance access; otherwise use offline/CSV.")
     uploaded_csv = None
-    if data_source == "Upload CSV":
-        uploaded_csv = st.sidebar.file_uploader("Close-price CSV", type=["csv"])
+    if ibkr_active:
+        data_source = "IBKR Live API"
+        st.sidebar.caption("📡 Prices stream from IBKR (per-ticker Yahoo fallback).")
+    else:
+        data_source = st.sidebar.radio(
+            "Price source", ["Yahoo Finance (live)", "Sample data (offline)", "Upload CSV"],
+            key="pc_data_source", help="Live needs Yahoo access; otherwise use offline/CSV.")
+        if data_source == "Upload CSV":
+            uploaded_csv = st.sidebar.file_uploader("Close-price CSV", type=["csv"])
 
     st.sidebar.markdown("### 💵 Risk-free rate")
     risk_free_rate = _risk_free_controls()
@@ -402,6 +476,7 @@ def render_sidebar() -> dict:
                        "results. Long-only weights; simulated Italian taxes.")
 
     return {
+        "architecture": architecture, "ibkr_active": ibkr_active, "ibkr_port": ibkr_port,
         "base_currency": base_currency, "data_source": data_source,
         "uploaded_csv": uploaded_csv, "risk_free_rate": risk_free_rate,
         "benchmark": benchmark, "lookback": int(lookback),
@@ -653,6 +728,13 @@ def _render_reallocation(target: PortfolioPoint, current, deployment, latest_pri
                            file_name=f"portfolio_configuration_{key_prefix}.csv", mime="text/csv",
                            use_container_width=True, key=f"config_{key_prefix}")
 
+        # ---- Live IBKR execution staging (placeholder for future routing) ----
+        if params.get("ibkr_active"):
+            st.checkbox("Stage Orders Directly to TWS Monitor", value=False, disabled=True,
+                        key=f"stage_tws_{key_prefix}",
+                        help="🔒 Reserved for live automated execution. Connected to "
+                             "TWS — direct order staging will be enabled in a future release.")
+
 
 def _render_watchlist(base_sharpe, recommendations, anchor_ticker) -> None:
     st.markdown("---")
@@ -884,26 +966,32 @@ def main() -> None:
     benchmark = params["benchmark"]
     base_ccy = params["base_currency"]
 
-    spinner = {"Yahoo Finance (live)": "Fetching prices & FX from Yahoo Finance…",
-               "Sample data (offline)": "Generating offline sample prices…",
-               "Upload CSV": "Reading uploaded prices…"}[source]
-    with st.spinner(spinner):
+    spinners = {"Yahoo Finance (live)": "Fetching prices & FX from Yahoo Finance…",
+                "Sample data (offline)": "Generating offline sample prices…",
+                "Upload CSV": "Reading uploaded prices…",
+                "IBKR Live API": "Streaming daily bars from Interactive Brokers…"}
+    with st.spinner(spinners.get(source, "Loading prices…")):
         try:
-            if source == "Yahoo Finance (live)":
-                data = _load_prices_live(universe, benchmark, params["lookback"], base_ccy)
+            if params["ibkr_active"] and st.session_state.get("_ibkr_provider") is not None:
+                provider = st.session_state["_ibkr_provider"]
+                data = _as_dict(provider.fetch_historical_prices(
+                    list(universe), lookback_years=params["lookback"],
+                    benchmark=benchmark, base_currency=base_ccy))
             elif source == "Sample data (offline)":
                 data = _load_prices_sample(universe, benchmark, params["lookback"], base_ccy)
-            else:
+            elif source == "Upload CSV":
                 if params["uploaded_csv"] is None:
                     st.error("Please upload a price CSV, or pick another data source.")
                     return
                 data = _as_dict(load_prices_from_csv(params["uploaded_csv"],
                                                      tickers=list(universe), benchmark=benchmark,
                                                      base_currency=base_ccy))
+            else:  # Yahoo Finance (live)
+                data = _load_prices_live(universe, benchmark, params["lookback"], base_ccy)
         except PriceDataError as exc:
             st.error(f"Data error: {exc}")
-            if source == "Yahoo Finance (live)":
-                st.info("If Yahoo Finance is blocked/rate-limited, switch to *Sample data (offline)*.")
+            if source in ("Yahoo Finance (live)", "IBKR Live API"):
+                st.info("If the data feed is blocked/rate-limited, switch to *Sample data (offline)*.")
             return
         except Exception as exc:  # noqa: BLE001
             st.error(f"Unexpected error while loading prices: {exc}")

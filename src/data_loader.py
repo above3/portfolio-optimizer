@@ -284,14 +284,58 @@ def fetch_price_history(
             "and your network connection."
         )
 
-    # Forward-fill small gaps, then drop tickers/rows that are still empty.
-    close = close.sort_index().ffill()
-    close = close.dropna(axis=1, how="all")
-    valid = [t for t in symbols if t in close.columns]
-    failed = [t for t in symbols if t not in valid]
+    return build_price_data(close, symbols, bench, base_currency, start=start, end=end)
 
-    # Keep only rows where every remaining asset has a price so the
-    # covariance estimate is computed on a common, aligned window.
+
+def fetch_close_prices(
+    tickers,
+    lookback_years: float = DEFAULT_LOOKBACK_YEARS,
+    end: dt.date | None = None,
+) -> pd.DataFrame:
+    """Download cleaned daily close prices as a plain DataFrame (no FX/metadata).
+
+    Lightweight helper used for per-ticker fallbacks (e.g. routing IBKR
+    subscription gaps through Yahoo). Returns an empty frame on total failure.
+    """
+    symbols = _normalise_tickers(tickers)
+    if not symbols:
+        return pd.DataFrame()
+    end = end or dt.date.today()
+    start = end - dt.timedelta(days=int(round(lookback_years * 365.25)))
+    try:
+        raw = yf.download(symbols, start=start.isoformat(), end=end.isoformat(),
+                          auto_adjust=True, progress=False, threads=True)
+    except Exception:  # noqa: BLE001 - degrade to empty frame
+        return pd.DataFrame()
+    close = _extract_close(raw, symbols)
+    if close.empty:
+        return pd.DataFrame()
+    return close.sort_index().ffill().dropna(axis=1, how="all")
+
+
+def build_price_data(
+    close: pd.DataFrame,
+    requested: list[str],
+    benchmark: str | None = None,
+    base_currency: str | None = None,
+    *,
+    currencies: dict[str, str] | None = None,
+    sectors: dict[str, str] | None = None,
+    start: dt.date | None = None,
+    end: dt.date | None = None,
+) -> PriceData:
+    """Assemble a :class:`PriceData` from a raw close-price frame.
+
+    Cleans/aligns the panel, splits out the benchmark, attaches currency/sector
+    metadata (fetched from Yahoo when not supplied — e.g. the IBKR provider
+    passes its own currencies), and normalises to ``base_currency`` via live FX
+    (graceful fallback). Reused by every :class:`~src.providers.BaseDataProvider`.
+    """
+    bench = str(benchmark).strip().upper() if benchmark else None
+    close = close.sort_index().ffill().dropna(axis=1, how="all")
+    valid = [t for t in requested if t in close.columns]
+    failed = [t for t in requested if t not in valid]
+
     prices = close[valid].dropna(how="any")
     if prices.empty or prices.shape[0] < 2:
         raise PriceDataError(
@@ -299,24 +343,31 @@ def fetch_price_history(
             "Try a longer lookback or different tickers."
         )
 
-    # Align the benchmark (if available) to the cleaned asset window.
     benchmark_prices = None
     if bench and bench in close.columns:
         benchmark_prices = close[bench].reindex(prices.index).ffill().dropna()
         if benchmark_prices.empty:
             benchmark_prices = None
 
-    # ---- Metadata (currency + sector) and FX normalisation ----
+    # ---- Metadata (currency + sector) ----
     notes: list[str] = []
     meta_symbols = list(valid) + ([bench] if benchmark_prices is not None else [])
-    metadata = fetch_asset_metadata(meta_symbols, default_currency=base_currency or "USD")
-    currencies = {t: metadata.get(t, {}).get("currency", base_currency or "USD")
-                  for t in meta_symbols}
-    sectors = {t: metadata.get(t, {}).get("sector", UNKNOWN_SECTOR) for t in valid}
+    if currencies is None or sectors is None:
+        metadata = fetch_asset_metadata(meta_symbols, default_currency=base_currency or "USD")
+    else:
+        metadata = {}
+    currencies = dict(currencies) if currencies is not None else {
+        t: metadata.get(t, {}).get("currency", base_currency or "USD") for t in meta_symbols}
+    sectors = dict(sectors) if sectors is not None else {
+        t: metadata.get(t, {}).get("sector", UNKNOWN_SECTOR) for t in valid}
 
+    # ---- FX normalisation ----
+    end = end or dt.date.today()
+    start = start or (end - dt.timedelta(days=365 * 6))
     if base_currency:
         base = base_currency.upper()
-        foreign = {c for c in currencies.values() if c and c != base}
+        foreign = {currencies.get(t, base) for t in meta_symbols
+                   if currencies.get(t, base) and currencies.get(t, base) != base}
         fx_series_map: dict[str, pd.Series] = {}
         for ccy in foreign:
             try:
@@ -330,7 +381,6 @@ def fetch_price_history(
                     benchmark_prices.to_frame(), {bench: currencies[bench]},
                     base, fx_series_map)
                 benchmark_prices = bench_frame.iloc[:, 0]
-        # After conversion, every asset is reported in the base currency.
         currencies = {t: base for t in currencies}
 
     return PriceData(
@@ -343,7 +393,7 @@ def fetch_price_history(
         benchmark_ticker=bench if benchmark_prices is not None else None,
         benchmark_prices=benchmark_prices,
         currencies={t: currencies.get(t, base_currency or "USD") for t in valid},
-        sectors=sectors,
+        sectors={t: sectors.get(t, UNKNOWN_SECTOR) for t in valid},
         base_currency=base_currency,
         notes=notes,
     )

@@ -54,6 +54,9 @@ Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 | **Macro-regime backtests** (2022/2008/2000 shocks) | `data_loader.apply_regime` |
 | **IBKR suffix mapping** (`.DE`/`.MI` → clean root) | `portfolio.map_ibkr_symbol` |
 | **HRP correlation cluster dendrogram** | `portfolio.hierarchical_clusters` |
+| **Abstract DataProvider framework** | `src/providers.py` (`BaseDataProvider`) |
+| **Live IBKR native engine** (`ib_insync`) | `providers.IBKRNativeProvider` |
+| **Hybrid live + manual holdings merge** | `portfolio.merge_holdings` |
 
 The chart shows the feasible-set cloud coloured by Sharpe ratio, the efficient
 frontier, the CML, the risk-free point, and star/diamond markers for the MVP,
@@ -208,6 +211,27 @@ portfolio, the tangency portfolio has the highest Sharpe ratio, the frontier is
 monotonic above the MVP, etc.).
 
 ---
+
+## Data architecture (provider framework)
+
+Price/metadata ingestion is abstracted behind `BaseDataProvider` (`src/providers.py`):
+
+- **`YahooFinanceProvider`** — the robust, decoupled / offline-safe default.
+- **`IBKRNativeProvider`** — a live engine that connects to a local **TWS
+  (`7496`)** or **IB Gateway (`4001`)** socket via `ib_insync`, ingesting the
+  account's cash, base currency and positions, and pulling daily bars from IBKR
+  with a **per-ticker Yahoo fallback** for assets lacking a market-data
+  subscription.
+
+Pick the engine from **"Active Data Architecture Source"** in the sidebar. When
+IBKR is selected the app connects, shows a green *"Connected to Account: Uxxxxxx"*
+badge and auto-populates the holdings table from the live feed. If TWS isn't
+running it cleanly falls back to safe layout mode. **Manual freedom is
+preserved at all times** — regardless of engine, you can always click **+** to
+add/edit/delete external assets (Trade Republic, bonds, funds, ETFs); live rows
+are *merged* on top via `portfolio.merge_holdings` without ever locking the
+table. `ib_insync` is optional: the app imports and unit-tests cleanly without
+it, and its asyncio loop is isolated via `util.startLoop()`.
 
 ## Local persistence
 
