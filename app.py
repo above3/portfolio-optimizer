@@ -25,6 +25,7 @@ from src.data_loader import (
     fetch_price_history,
     fetch_risk_free_rate,
 )
+from src.data_loader import iso_timestamp
 from src.optimizer import (
     AnchorConstraint,
     FrontierResult,
@@ -33,8 +34,10 @@ from src.optimizer import (
     analyse,
     backtest_equity_curves,
     buy_only_max_sharpe,
+    required_capital_to_align,
     screen_watchlist,
     simulate_gbm_wealth,
+    weight_tracking_error,
 )
 from src.portfolio import (
     CurrentPortfolio,
@@ -42,7 +45,9 @@ from src.portfolio import (
     PortfolioStore,
     basket_trader_csv,
     build_current_portfolio,
+    build_executive_report_html,
     classify_noise,
+    compute_pac_metrics,
     deployment_plan,
     hierarchical_clusters,
     merge_holdings,
@@ -57,6 +62,7 @@ from src.sample_data import generate_sample_prices, load_prices_from_csv
 from src.visualization import (
     backtest_figure,
     correlation_heatmap,
+    custodian_donut,
     dendrogram_figure,
     efficient_frontier_figure,
     gbm_fan_chart,
@@ -94,6 +100,13 @@ div[data-testid="stMetricValue"] { font-weight: 700; }
 .stButton>button, .stDownloadButton>button { border-radius: 10px; border: 1px solid var(--pc-border); font-weight: 600; }
 .stTabs [data-baseweb="tab-list"] { gap: 4px; }
 .stTabs [data-baseweb="tab"] { background: var(--pc-card); border-radius: 8px 8px 0 0; }
+/* Tranche drift efficiency bar */
+.pc-drift-track { background:#11141b; border:1px solid var(--pc-border); border-radius:999px;
+    height:22px; width:100%; overflow:hidden; margin:6px 0; }
+.pc-drift-fill { height:100%; border-radius:999px; text-align:right; color:#08130c;
+    font-weight:700; font-size:.74rem; line-height:22px; padding-right:10px;
+    background:linear-gradient(90deg,#27ae60,#2ecc71); }
+.pc-drift-low .pc-drift-fill { background:linear-gradient(90deg,#c0392b,#e74c3c); color:#fff; }
 </style>
 """
 
@@ -315,6 +328,7 @@ def _init_state() -> None:
     st.session_state.setdefault("ibkr_file_id", None)
     st.session_state.setdefault("ibkr_ingest_id", None)
     st.session_state.setdefault("auto_run", False)
+    st.session_state.setdefault("has_run", False)
     _seed_settings(store)
 
 
@@ -335,6 +349,62 @@ def _ingest_ibkr_positions(snapshot) -> None:
     st.session_state.ibkr_ingest_id = guard
     st.session_state.editor_version += 1
     st.session_state.auto_run = True
+
+
+def _freeze_live_snapshot(provider, snapshot) -> None:
+    """Thread-safely freeze the live account to the local DB and go offline."""
+    store = _get_store()
+    payload = {
+        "account_id": snapshot.account_id,
+        "base_currency": snapshot.base_currency,
+        "cash": snapshot.cash,
+        "timestamp": iso_timestamp(),
+        "positions": [
+            {"symbol": p.symbol, "shares": p.shares, "avg_cost": p.avg_cost,
+             "currency": p.currency, "sec_type": p.sec_type, "asset_type": p.asset_type}
+            for p in snapshot.positions],
+    }
+    store.save_frozen_snapshot(payload)
+    try:
+        provider.disconnect()  # terminate the ib_insync loop
+    except Exception:  # noqa: BLE001
+        pass
+    _connect_ibkr.clear()
+    st.session_state["force_offline"] = True
+
+
+def _load_frozen_into_table(snapshot: dict) -> None:
+    """Merge a frozen snapshot's positions into the editable table (once)."""
+    guard = f"frozen:{snapshot.get('timestamp')}"
+    if st.session_state.get("ibkr_ingest_id") == guard:
+        return
+    live = positions_to_holdings_df(snapshot.get("positions", []))
+    if not live.empty:
+        st.session_state.holdings_df = merge_holdings(live, st.session_state.holdings_df)
+    st.session_state.ibkr_ingest_id = guard
+    st.session_state.editor_version += 1
+
+
+def _drift_efficiency_bar(efficiency: float, required_cash: float,
+                          alignable: bool, ccy: str) -> None:
+    """Custom CSS progress bar for the cash-inflow drift efficiency monitor."""
+    pct = max(0.0, min(efficiency, 1.0)) * 100.0
+    low = " pc-drift-low" if pct < 60 else ""
+    st.markdown("**🎯 Tranche Drift Efficiency**")
+    st.markdown(
+        f'<div class="pc-drift-track{low}"><div class="pc-drift-fill" '
+        f'style="width:{pct:.1f}%">{pct:.0f}%</div></div>', unsafe_allow_html=True)
+    if pct >= 99.5 and alignable:
+        st.caption("✅ This tranche fully aligns the portfolio to the Max-Sharpe node "
+                   "with no sell liquidation.")
+    elif not alignable:
+        st.caption(f"Current tranche efficiency is **{pct:.0f}%**. Some held assets sit "
+                   "above their target weight — perfect alignment would require a "
+                   "sale (blocked in buy-only mode).")
+    else:
+        st.caption(f"Current tranche efficiency is **{pct:.0f}%**. To perfectly align to "
+                   f"the Max Sharpe node without triggering sell-liquidation taxes, your "
+                   f"required tranche capital injection is **{_money(required_cash, ccy)}**.")
 
 
 # --------------------------------------------------------------------------- #
@@ -359,13 +429,30 @@ def _risk_free_controls() -> float:
 def _ibkr_connection_panel() -> tuple[bool, int]:
     """Render the IBKR socket selector + live connection status.
 
-    Returns ``(ibkr_active, port)``. On any connection failure it cleanly falls
-    back to safe layout mode (``ibkr_active=False``) without losing manual rows.
+    Returns ``(ibkr_active, port)``. On failure (or a frozen/offline state) it
+    cleanly falls back to safe layout mode (``ibkr_active=False``) while keeping
+    the app fully operational on the last frozen snapshot.
     """
+    store = _get_store()
     port_label = st.sidebar.selectbox("Native socket", list(config.IBKR_PORT_CHOICES),
                                       key="pc_ibkr_port")
     port = config.IBKR_PORT_CHOICES[port_label]
     st.session_state.pop("_ibkr_provider", None)
+
+    # ---- Frozen / offline mode (after a "Freeze Live Snapshot") ----
+    if st.session_state.get("force_offline"):
+        snap = store.load_frozen_snapshot()
+        if snap:
+            _load_frozen_into_table(snap)
+            st.session_state["frozen_banner"] = snap.get("timestamp")
+            st.sidebar.warning(f"❄️ Frozen snapshot loaded · {snap.get('timestamp')}")
+            if st.sidebar.button("🔌 Reconnect Live", use_container_width=True):
+                st.session_state["force_offline"] = False
+                _connect_ibkr.clear()
+                st.rerun()
+            return False, port
+        st.session_state["force_offline"] = False  # nothing frozen -> normal flow
+
     with st.spinner("Connecting to Local TWS/Gateway Socket…"):
         try:
             provider = _connect_ibkr(DEFAULT_IBKR_HOST, port, DEFAULT_IBKR_CLIENT_ID)
@@ -374,17 +461,27 @@ def _ibkr_connection_panel() -> tuple[bool, int]:
             st.sidebar.info(f"ℹ️ TWS not detected on {DEFAULT_IBKR_HOST}:{port}. "
                             "Falling back to safe layout mode.")
             st.sidebar.caption(f"({exc})")
+            frozen = store.load_frozen_snapshot()
+            if frozen:
+                _load_frozen_into_table(frozen)
+                st.session_state["frozen_banner"] = frozen.get("timestamp")
+                st.sidebar.warning(f"❄️ Loaded last frozen snapshot · {frozen.get('timestamp')}")
             return False, port
+
     st.session_state["_ibkr_provider"] = provider
     st.sidebar.success(f"🟢 Connected to Account: **{snapshot.account_id}** · "
                        f"cash {_money(snapshot.cash, st.session_state.get('pc_currency'))}")
     _ingest_ibkr_positions(snapshot)
+    if st.sidebar.button("🧊 Freeze Live Snapshot & Go Offline", use_container_width=True):
+        _freeze_live_snapshot(provider, snapshot)
+        st.rerun()
     return True, port
 
 
 def render_sidebar() -> dict:
     st.sidebar.header("⚙️ Parameters")
     st.sidebar.caption("💾 Settings & holdings auto-save to a local database.")
+    st.session_state["frozen_banner"] = None  # recomputed by the IBKR panel
 
     st.sidebar.markdown("### 🛰️ Active Data Architecture Source")
     architecture = st.sidebar.radio("Engine", config.DATA_ARCHITECTURES,
@@ -675,7 +772,7 @@ def _deployment_metrics(deployment, ccy: str) -> None:
 
 def _render_reallocation(target: PortfolioPoint, current, deployment, latest_prices,
                          mu, params, asset_types, sectors, ccy, key_prefix: str,
-                         buy_only: bool = False) -> None:
+                         buy_only: bool = False, reference_weights: dict | None = None) -> None:
     sym = _sym(ccy)
     if buy_only:
         st.success("🛒 **Buy-Only mode** — deploying new cash without selling "
@@ -698,6 +795,16 @@ def _render_reallocation(target: PortfolioPoint, current, deployment, latest_pri
             st.caption(f"🧩 Smart knapsack rounding · residual cash "
                        f"{sym}{res.residual_cash:,.2f} · integer tracking error "
                        f"{res.tracking_error:.4f}.")
+
+        # ---- Cash-inflow drift efficiency monitor (buy-only) ----
+        if buy_only and reference_weights:
+            current_vals = current.values if current is not None else {}
+            current_w = current.weights if current is not None else {}
+            te_target = weight_tracking_error(res.achieved_weights, reference_weights)
+            te_base = weight_tracking_error(current_w, reference_weights)
+            efficiency = 1.0 if te_base <= 1e-9 else max(0.0, (te_base - te_target) / te_base)
+            required_cash, alignable = required_capital_to_align(current_vals, reference_weights)
+            _drift_efficiency_bar(efficiency, required_cash, alignable, ccy)
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Trades", res.num_trades)
@@ -833,6 +940,110 @@ def _render_montecarlo(result, deployment, params, ccy) -> None:
     st.caption(f"Total contributed over horizon: {_money(proj.total_contributed, ccy)}.")
 
 
+def _record_tranche_controls(current, deployment, ccy: str) -> None:
+    """Button to log the active deployment into the PAC tranche ledger."""
+    store = _get_store()
+    pv = current.total_value if current is not None else 0.0
+    c1, c2 = st.columns([1, 2])
+    if c1.button("📌 Record this tranche deployment", use_container_width=True,
+                 help="Logs the active capital + portfolio value to the PAC ledger "
+                      "for TWR/MWR tracking over time."):
+        ok = store.record_tranche(deployment.active_capital, deployment.strategy, pv)
+        if ok:
+            st.success(f"Recorded tranche of {_money(deployment.active_capital, ccy)} "
+                       f"at portfolio value {_money(pv, ccy)}.")
+        else:
+            st.error("Could not write to the local ledger.")
+    c2.caption("Build a Piano di Accumulo (PAC) history to evaluate TWR vs MWR over time.")
+
+
+def _render_pac_ledger(current, ccy: str) -> None:
+    st.subheader("PAC Performance Ledger — TWR vs MWR")
+    store = _get_store()
+    history = store.load_tranche_history()
+    if history is None or history.empty:
+        st.info("No tranche deployments recorded yet. Use **📌 Record this tranche "
+                "deployment** under *Capital deployment & reallocation* to build the "
+                "savings-plan history, then revisit this tab.")
+        return
+
+    current_value = current.total_value if current is not None else 0.0
+    metrics = compute_pac_metrics(history, current_value)
+    if metrics is None:
+        st.warning("Not enough valid ledger data (or zero current value) to compute "
+                   "TWR / MWR yet.")
+        st.dataframe(history, hide_index=True, use_container_width=True)
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        _card("Time-Weighted Return (TWR, ann.)", f"{metrics.twr_annual * 100:.2f}%",
+              "Allocation-engine quality (cash-timing neutral)", _tone_for(metrics.twr_annual))
+    with c2:
+        mwr_txt = "n/a" if metrics.mwr_annual != metrics.mwr_annual else f"{metrics.mwr_annual * 100:.2f}%"
+        _card("Money-Weighted Return (MWR / IRR)", mwr_txt,
+              "Your actual €/$ compounding velocity",
+              _tone_for(metrics.mwr_annual if metrics.mwr_annual == metrics.mwr_annual else 0))
+    with c3:
+        _card("Total Gain", _money(metrics.total_gain, ccy),
+              f"on {_money(metrics.total_contributed, ccy)} contributed over "
+              f"{metrics.period_years:.1f}y", _tone_for(metrics.total_gain))
+
+    st.markdown("**Capital-inflow history**")
+    st.dataframe(history, hide_index=True, use_container_width=True)
+    if st.button("🗑️ Clear PAC ledger"):
+        store.clear_tranche_history()
+        st.rerun()
+
+
+def _render_executive_report(result, current, deployment, latest_prices, params,
+                             asset_types) -> None:
+    ccy = params["base_currency"]
+    with st.expander("🧾 Executive Investment Report"):
+        st.caption("Compile a printable, dark-mode HTML report (P&L, efficient "
+                   "frontier, custodian donut, IBKR basket matrix).")
+        if st.button("Generate Executive Investment Report", type="secondary"):
+            try:
+                ef_html = efficient_frontier_figure(result, current).to_html(
+                    full_html=False, include_plotlyjs="cdn")
+                donut_html = custodian_donut(
+                    current.values if current is not None else {}, _sym(ccy)).to_html(
+                    full_html=False, include_plotlyjs=False)
+                target = result.tangency or result.mvp
+                res = reallocation_plan(
+                    current.values if current is not None else {}, target.weights,
+                    deployment.active_capital, latest_prices, mu=result.mu,
+                    allow_fractional=params["allow_fractional"],
+                    purchase_prices=current.purchase_prices if current else {},
+                    asset_types=asset_types)
+                from io import StringIO
+                basket_df = pd.read_csv(StringIO(basket_trader_csv(res))) \
+                    if basket_trader_csv(res).strip().count("\n") >= 1 else pd.DataFrame()
+                pnl = {
+                    "total_value": current.total_value if current else 0.0,
+                    "total_pnl": current.total_pnl if current and current.has_cost_data else 0.0,
+                    "pnl_pct": (current.total_pnl / current.total_cost * 100)
+                    if current and current.has_cost_data and current.total_cost > 0 else 0.0,
+                    "total_cost": current.total_cost if current and current.has_cost_data else 0.0,
+                }
+                st.session_state["exec_report_html"] = build_executive_report_html(
+                    title="Executive Investment Report",
+                    base_currency=ccy, generated_at=iso_timestamp(), pnl=pnl,
+                    ef_chart_html=ef_html, donut_chart_html=donut_html,
+                    basket_df=basket_df,
+                    extra_note="Max-Sharpe tangency allocation")
+            except Exception as exc:  # noqa: BLE001 - never crash the dashboard
+                st.session_state["exec_report_html"] = None
+                st.error(f"Could not generate the report: {exc}")
+        if st.session_state.get("exec_report_html"):
+            st.success("Report ready — download below (print to PDF from your browser).")
+            st.download_button("⬇️ Download Report (.html)",
+                               st.session_state["exec_report_html"],
+                               file_name="executive_investment_report.html",
+                               mime="text/html", use_container_width=True,
+                               key="dl_exec_report")
+
+
 # --------------------------------------------------------------------------- #
 # Top-level results renderer
 # --------------------------------------------------------------------------- #
@@ -845,9 +1056,11 @@ def render_results(result, current, noise, deployment, data, params,
     st.subheader("💹 Real-time P&L & behavioral check")
     _pnl_ledger(current, ccy)
     _noise_section(noise)
+    _render_executive_report(result, current, deployment, latest_prices, params, asset_types)
 
-    tab_opt, tab_bt, tab_mc = st.tabs(
-        ["📊 Optimization", "📈 Historical Backtest Analysis", "🎲 Monte Carlo Projection"])
+    tab_opt, tab_bt, tab_mc, tab_pac = st.tabs(
+        ["📊 Optimization", "📈 Historical Backtest Analysis",
+         "🎲 Monte Carlo Projection", "🧾 PAC Performance Ledger"])
 
     with tab_opt:
         caption_bits = [f"Returns model: **{result.returns_model.replace('_', ' ').title()}**",
@@ -872,6 +1085,7 @@ def render_results(result, current, noise, deployment, data, params,
         st.markdown("---")
         st.subheader("Capital deployment & reallocation")
         _deployment_metrics(deployment, ccy)
+        _record_tranche_controls(current, deployment, ccy)
         tab_tan, tab_mvp = st.tabs(["🚀 Max Sharpe (Tangency)", "🛡️ Minimum variance"])
         with tab_tan:
             if result.tangency is None:
@@ -893,7 +1107,8 @@ def render_results(result, current, noise, deployment, data, params,
                         st.warning("No feasible buy-only target; showing standard rebalance.")
                 _render_reallocation(target, current, deployment, latest_prices,
                                      result.mu, params, asset_types, result.sector_map,
-                                     ccy, "tan", buy_only=use_buy_only)
+                                     ccy, "tan", buy_only=use_buy_only,
+                                     reference_weights=result.tangency.weights)
         with tab_mvp:
             _render_reallocation(result.mvp, current, deployment, latest_prices,
                                  result.mu, params, asset_types, result.sector_map, ccy, "mvp")
@@ -924,6 +1139,9 @@ def render_results(result, current, noise, deployment, data, params,
     with tab_mc:
         _render_montecarlo(result, deployment, params, ccy)
 
+    with tab_pac:
+        _render_pac_ledger(current, ccy)
+
 
 # --------------------------------------------------------------------------- #
 # Main
@@ -941,6 +1159,11 @@ def main() -> None:
                 "backtesting · GBM projection · IBKR export.")
 
     params = render_sidebar()
+
+    frozen_ts = st.session_state.get("frozen_banner")
+    if frozen_ts:
+        st.warning(f"❄️ Displaying Frozen Portfolio Snapshot from **{frozen_ts}**. "
+                   "(TWS Offline Mode) — backtester & Monte-Carlo remain fully operational.")
     edited, watchlist = render_data_input()
 
     # Auto-commit holdings + settings to the local DB on every interaction.
@@ -949,7 +1172,11 @@ def main() -> None:
     run = st.button("🔍 Optimize portfolio", type="primary", use_container_width=True)
     auto_run = st.session_state.auto_run
     st.session_state.auto_run = False
-    if not (run or auto_run):
+    if run or auto_run:
+        st.session_state["has_run"] = True
+    # Results stay sticky once computed, so in-panel buttons (record tranche,
+    # report, freeze) re-render without forcing another Optimize click.
+    if not st.session_state.get("has_run"):
         st.info("Edit or import your holdings, set parameters, then click **Optimize portfolio**.")
         return
 

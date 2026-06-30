@@ -779,3 +779,95 @@ def test_mock_ibkr_provider_pipeline():
     assert snap.account_id == "U999999" and snap.cash == 12_345.0
     data = mock.fetch_historical_prices(["AAPL", "MSFT"])
     assert list(data.prices.columns) == ["AAPL", "MSFT"]
+
+
+# --------------------------------------------------------------------------- #
+# PAC ledger: tranche history + TWR/MWR
+# --------------------------------------------------------------------------- #
+def test_tranche_history_store_roundtrip(tmp_path):
+    store = PortfolioStore(tmp_path / "pac.db")
+    store.record_tranche(1000.0, "DCA", 0.0, "2024-01-01T00:00:00+00:00")
+    store.record_tranche(2100.0, "DCA", 1100.0, "2024-02-01T00:00:00+00:00")
+    hist = store.load_tranche_history()
+    assert len(hist) == 2
+    assert list(hist.columns) == ["timestamp", "active_capital_deployed",
+                                  "strategy_used", "portfolio_value_at_deployment"]
+    assert store.clear_tranche_history() is True
+    assert store.load_tranche_history().empty
+
+
+def test_compute_pac_metrics_twr_mwr(tmp_path):
+    from src.portfolio import compute_pac_metrics
+    store = PortfolioStore(tmp_path / "pac.db")
+    store.record_tranche(1000.0, "DCA", 0.0, "2024-01-01T00:00:00+00:00")
+    store.record_tranche(2100.0, "DCA", 1100.0, "2024-02-01T00:00:00+00:00")
+    store.record_tranche(3200.0, "DCA", 2200.0, "2024-03-01T00:00:00+00:00")  # +1000
+    metrics = compute_pac_metrics(store.load_tranche_history(), current_value=3600.0,
+                                  as_of="2024-04-01T00:00:00+00:00")
+    assert metrics is not None
+    assert metrics.total_contributed == pytest.approx(3000.0)   # 1000 x 3 external
+    assert metrics.total_gain == pytest.approx(600.0)
+    assert metrics.twr_annual == metrics.twr_annual            # finite
+    assert metrics.mwr_annual > 0                              # positive IRR
+
+
+def test_pac_metrics_none_when_empty(tmp_path):
+    from src.portfolio import compute_pac_metrics
+    store = PortfolioStore(tmp_path / "pac.db")
+    assert compute_pac_metrics(store.load_tranche_history(), 1000.0) is None
+
+
+def test_xirr_simple_doubling():
+    from src.portfolio import xirr
+    import datetime as dt
+    cfs = [(dt.datetime(2024, 1, 1), -1000.0), (dt.datetime(2025, 1, 1), 1100.0)]
+    assert xirr(cfs) == pytest.approx(0.10, abs=1e-3)  # ~10% annual
+
+
+# --------------------------------------------------------------------------- #
+# Frozen snapshot persistence
+# --------------------------------------------------------------------------- #
+def test_frozen_snapshot_roundtrip(tmp_path):
+    store = PortfolioStore(tmp_path / "frozen.db")
+    assert store.load_frozen_snapshot() is None
+    store.save_frozen_snapshot({"account_id": "U777", "base_currency": "USD",
+                                "cash": 1000.0,
+                                "positions": [{"symbol": "AAPL", "shares": 5}]})
+    snap = store.load_frozen_snapshot()
+    assert snap is not None and snap["is_frozen"] is True
+    assert snap["account_id"] == "U777" and "timestamp" in snap
+    store.clear_frozen_snapshot()
+    assert store.load_frozen_snapshot() is None
+
+
+# --------------------------------------------------------------------------- #
+# Drift efficiency helpers
+# --------------------------------------------------------------------------- #
+def test_weight_tracking_error_and_required_capital():
+    from src.optimizer import required_capital_to_align, weight_tracking_error
+    assert weight_tracking_error({"A": 0.5, "B": 0.5}, {"A": 0.5, "B": 0.5}) == pytest.approx(0.0)
+    te = weight_tracking_error({"A": 1.0}, {"A": 0.0, "B": 1.0})
+    assert te == pytest.approx(np.sqrt(2.0))
+    # Binding asset A: 6000/0.5 = 12000 total needed; current 7000 -> 5000 new cash.
+    req, alignable = required_capital_to_align({"A": 6000.0, "B": 1000.0},
+                                               {"A": 0.5, "B": 0.3, "C": 0.2})
+    assert req == pytest.approx(5000.0) and alignable is True
+    # Held asset with zero target -> not alignable by buying only.
+    _, alignable2 = required_capital_to_align({"A": 6000.0, "Z": 2000.0}, {"A": 1.0})
+    assert alignable2 is False
+
+
+# --------------------------------------------------------------------------- #
+# Executive report HTML
+# --------------------------------------------------------------------------- #
+def test_build_executive_report_html():
+    from src.portfolio import build_executive_report_html
+    html = build_executive_report_html(
+        title="Exec", base_currency="EUR", generated_at="2024-01-01",
+        pnl={"total_value": 10000, "total_pnl": 1500, "pnl_pct": 17.6, "total_cost": 8500},
+        ef_chart_html="<div>EFX</div>", donut_chart_html="<div>DNT</div>",
+        basket_df=pd.DataFrame([{"Action": "BUY", "Quantity": 5, "Symbol": "VWCE",
+                                 "OrderType": "MKT"}]))
+    assert html.startswith("<!doctype html>")
+    assert "EFX" in html and "DNT" in html and "BUY" in html
+    assert "#0e1117" in html and "€" in html  # dark palette + EUR symbol

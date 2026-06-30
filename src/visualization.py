@@ -304,3 +304,21 @@ def dendrogram_figure(tree: ClusterTree) -> go.Figure:
         yaxis_title="Cluster distance √(½(1−ρ))",
         template="plotly_white", height=440)
     return fig
+
+
+def custodian_donut(values: dict, currency_symbol: str = "$") -> go.Figure:
+    """Donut breakdown of the current holdings by market value."""
+    items = [(t, float(v)) for t, v in (values or {}).items() if float(v) > 0]
+    items.sort(key=lambda kv: kv[1], reverse=True)
+    labels = [t for t, _ in items] or ["—"]
+    vals = [v for _, v in items] or [1.0]
+    fig = go.Figure(data=[go.Pie(
+        labels=labels, values=vals, hole=0.55, sort=False,
+        marker=dict(line=dict(color="#0e1117", width=1)),
+        hovertemplate="%{label}<br>" + currency_symbol +
+                      "%{value:,.0f}<br>%{percent}<extra></extra>")])
+    fig.update_layout(
+        title="Custodian Allocation (by market value)",
+        template="plotly_white", height=380,
+        legend=dict(orientation="v", x=1.0, y=0.5))
+    return fig

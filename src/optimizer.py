@@ -414,6 +414,43 @@ def max_sharpe_portfolio(
     return None
 
 
+def weight_tracking_error(
+    weights_a: dict[str, float], weights_b: dict[str, float]
+) -> float:
+    """Euclidean distance between two weight vectors over their union of keys."""
+    keys = set(weights_a) | set(weights_b)
+    return float(np.sqrt(sum(
+        (float(weights_a.get(k, 0.0)) - float(weights_b.get(k, 0.0))) ** 2 for k in keys)))
+
+
+def required_capital_to_align(
+    current_values: dict[str, float], target_weights: dict[str, float]
+) -> tuple[float, bool]:
+    """Minimum **new cash** to reach ``target_weights`` by buying only (no sells).
+
+    For each target asset the post-injection total must satisfy
+    ``w_i * T >= current_value_i``; the binding asset sets ``T_min`` and the
+    required injection is ``T_min - current_total``. Perfect alignment is
+    impossible (``alignable=False``) if any *held* asset has a (near) zero target
+    weight, since reaching it would require a sale.
+
+    Returns ``(required_new_cash, alignable)``.
+    """
+    current_total = sum(float(v) for v in current_values.values())
+    t_min = current_total
+    alignable = True
+    for ticker, value in current_values.items():
+        value = float(value)
+        if value <= 0:
+            continue
+        weight = float(target_weights.get(ticker, 0.0))
+        if weight <= 1e-9:
+            alignable = False  # held but target ~0 -> needs a sell
+            continue
+        t_min = max(t_min, value / weight)
+    return max(0.0, t_min - current_total), alignable
+
+
 def buy_only_max_sharpe(
     mu: pd.Series,
     cov: pd.DataFrame,

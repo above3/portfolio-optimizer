@@ -57,6 +57,10 @@ Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 | **Abstract DataProvider framework** | `src/providers.py` (`BaseDataProvider`) |
 | **Live IBKR native engine** (`ib_insync`) | `providers.IBKRNativeProvider` |
 | **Hybrid live + manual holdings merge** | `portfolio.merge_holdings` |
+| **PAC ledger** (TWR + MWR/XIRR) | `portfolio.compute_pac_metrics` |
+| **Cash-inflow drift efficiency monitor** | `optimizer.required_capital_to_align` |
+| **Executive HTML report export** | `portfolio.build_executive_report_html` |
+| **Live snapshot freeze + offline recovery** | `PortfolioStore.save_frozen_snapshot` |
 
 The chart shows the feasible-set cloud coloured by Sharpe ratio, the efficient
 frontier, the CML, the risk-free point, and star/diamond markers for the MVP,

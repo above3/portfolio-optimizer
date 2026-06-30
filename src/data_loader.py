@@ -20,6 +20,12 @@ from .config import (
 )
 
 
+def iso_timestamp(when: dt.datetime | None = None) -> str:
+    """UTC ISO-8601 timestamp (seconds precision) — shared across persistence."""
+    moment = when or dt.datetime.now(dt.timezone.utc)
+    return moment.replace(microsecond=0).isoformat()
+
+
 class PriceDataError(RuntimeError):
     """Raised when usable price data cannot be obtained for the request."""
 

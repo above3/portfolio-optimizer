@@ -31,7 +31,7 @@ from .config import (
     TAX_RATE_EQUITY,
     UNKNOWN_SECTOR,
 )
-from .data_loader import PriceDataError
+from .data_loader import PriceDataError, iso_timestamp
 from .optimizer import performance
 
 # Substrings hinting that a ticker is a bond / fixed-income instrument.
@@ -855,6 +855,13 @@ class PortfolioStore:
                 "CREATE TABLE IF NOT EXISTS app_state "
                 "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS tranche_history ("
+                "timestamp TEXT NOT NULL, "
+                "active_capital_deployed REAL NOT NULL, "
+                "strategy_used TEXT, "
+                "portfolio_value_at_deployment REAL NOT NULL)"
+            )
 
     def _init_schema(self) -> None:
         try:
@@ -960,6 +967,64 @@ class PortfolioStore:
         self.save_watchlist(watchlist)
         self.save_settings(settings)
 
+    # -- tranche history (PAC ledger) ------------------------------------- #
+    def record_tranche(
+        self,
+        active_capital_deployed: float,
+        strategy_used: str,
+        portfolio_value_at_deployment: float,
+        timestamp: str | None = None,
+    ) -> bool:
+        """Append a capital-deployment event to the ``tranche_history`` table."""
+        timestamp = timestamp or iso_timestamp()
+        try:
+            with self._connect() as con:
+                con.execute(
+                    "INSERT INTO tranche_history(timestamp, active_capital_deployed, "
+                    "strategy_used, portfolio_value_at_deployment) VALUES (?, ?, ?, ?)",
+                    (timestamp, float(active_capital_deployed), str(strategy_used),
+                     float(portfolio_value_at_deployment)))
+            return True
+        except sqlite3.DatabaseError:
+            return False
+
+    def load_tranche_history(self) -> pd.DataFrame:
+        """Return the recorded deployment events ordered by timestamp."""
+        cols = ["timestamp", "active_capital_deployed", "strategy_used",
+                "portfolio_value_at_deployment"]
+        try:
+            with self._connect() as con:
+                rows = con.execute(
+                    "SELECT timestamp, active_capital_deployed, strategy_used, "
+                    "portfolio_value_at_deployment FROM tranche_history "
+                    "ORDER BY timestamp ASC").fetchall()
+        except sqlite3.DatabaseError:
+            return pd.DataFrame(columns=cols)
+        return pd.DataFrame(rows, columns=cols)
+
+    def clear_tranche_history(self) -> bool:
+        try:
+            with self._connect() as con:
+                con.execute("DELETE FROM tranche_history")
+            return True
+        except sqlite3.DatabaseError:
+            return False
+
+    # -- frozen live snapshot (offline recovery) -------------------------- #
+    def save_frozen_snapshot(self, snapshot: dict) -> bool:
+        """Persist a frozen live snapshot (``is_frozen=True``) for offline use."""
+        payload = dict(snapshot)
+        payload["is_frozen"] = True
+        payload.setdefault("timestamp", iso_timestamp())
+        return self.set("frozen_snapshot", payload)
+
+    def load_frozen_snapshot(self) -> dict | None:
+        value = self.get("frozen_snapshot")
+        return value if isinstance(value, dict) and value.get("is_frozen") else None
+
+    def clear_frozen_snapshot(self) -> bool:
+        return self.set("frozen_snapshot", None)
+
 
 def normalise_holdings_df(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure the holdings frame has exactly the expected schema/columns."""
@@ -1041,3 +1106,192 @@ def merge_holdings(primary: pd.DataFrame, secondary: pd.DataFrame) -> pd.DataFra
             seen.add(ticker)
             rows.append({c: row[c] for c in HOLDINGS_COLUMNS})
     return normalise_holdings_df(pd.DataFrame(rows, columns=list(HOLDINGS_COLUMNS)))
+
+
+# --------------------------------------------------------------------------- #
+# PAC performance ledger (Time-Weighted & Money-Weighted returns)
+# --------------------------------------------------------------------------- #
+@dataclass
+class PacMetrics:
+    """Reconstructed savings-plan performance from the tranche history."""
+
+    twr_annual: float
+    mwr_annual: float
+    twr_cumulative: float
+    total_contributed: float
+    current_value: float
+    total_gain: float
+    period_years: float
+    n_events: int
+
+
+def _xnpv(rate: float, cashflows: list[tuple]) -> float:
+    """Net present value of dated cashflows at an annual ``rate``."""
+    t0 = cashflows[0][0]
+    return sum(amt / (1.0 + rate) ** ((d - t0).days / 365.0) for d, amt in cashflows)
+
+
+def xirr(cashflows: list[tuple], lo: float = -0.999999, hi: float = 10.0,
+         tol: float = 1e-7, max_iter: int = 200) -> float:
+    """Money-weighted IRR for dated cashflows via robust bisection.
+
+    ``cashflows`` is a list of ``(datetime, amount)`` with at least one negative
+    (investment) and one positive (final value). Returns ``nan`` when no root
+    brackets the interval.
+    """
+    if len(cashflows) < 2:
+        return float("nan")
+    try:
+        f_lo, f_hi = _xnpv(lo, cashflows), _xnpv(hi, cashflows)
+    except (ZeroDivisionError, OverflowError):
+        return float("nan")
+    if not (f_lo == f_lo and f_hi == f_hi) or f_lo * f_hi > 0:
+        return float("nan")
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2.0
+        f_mid = _xnpv(mid, cashflows)
+        if abs(f_mid) < tol:
+            return mid
+        if f_lo * f_mid < 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return (lo + hi) / 2.0
+
+
+def compute_pac_metrics(
+    history: pd.DataFrame,
+    current_value: float,
+    as_of: str | None = None,
+) -> PacMetrics | None:
+    """Compute TWR and MWR (XIRR) from the recorded tranche-deployment history.
+
+    Each event stores the portfolio value just before deployment and the active
+    capital pool deployed; the external cashflow is their difference. Returns
+    ``None`` when there is insufficient data.
+    """
+    if history is None or len(history) == 0 or current_value is None or current_value <= 0:
+        return None
+    df = history.copy()
+    df["dt"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    df = df.dropna(subset=["dt"]).sort_values("dt")
+    if df.empty:
+        return None
+
+    as_of_dt = (pd.to_datetime(as_of, utc=True) if as_of
+                else pd.Timestamp.now(tz="UTC")).to_pydatetime()
+    events = []
+    for _, row in df.iterrows():
+        value = float(row["portfolio_value_at_deployment"])
+        deployed = float(row["active_capital_deployed"])
+        events.append({"dt": row["dt"].to_pydatetime(),
+                       "value": value, "cashflow": max(deployed - value, 0.0)})
+
+    # Time-Weighted Return: chained sub-period growth factors.
+    factors = []
+    for i, ev in enumerate(events):
+        start_val = ev["value"] + ev["cashflow"]
+        end_val = events[i + 1]["value"] if i + 1 < len(events) else current_value
+        if start_val > 0:
+            factors.append(end_val / start_val)
+    twr_cum = float(np.prod(factors) - 1.0) if factors else float("nan")
+    period_years = max((as_of_dt - events[0]["dt"]).days / 365.0, 1e-9)
+    if period_years >= 0.08 and twr_cum == twr_cum and (1.0 + twr_cum) > 0:
+        twr_annual = (1.0 + twr_cum) ** (1.0 / period_years) - 1.0
+    else:
+        twr_annual = twr_cum
+
+    # Money-Weighted Return (XIRR): investments out, final value in.
+    cashflows = [(events[0]["dt"], -(events[0]["value"] + events[0]["cashflow"]))]
+    cashflows += [(ev["dt"], -ev["cashflow"]) for ev in events[1:]]
+    cashflows.append((as_of_dt, float(current_value)))
+    mwr = xirr(cashflows)
+
+    contributed = events[0]["value"] + sum(ev["cashflow"] for ev in events)
+    return PacMetrics(
+        twr_annual=twr_annual, mwr_annual=mwr, twr_cumulative=twr_cum,
+        total_contributed=contributed, current_value=float(current_value),
+        total_gain=float(current_value) - contributed,
+        period_years=period_years, n_events=len(events))
+
+
+# --------------------------------------------------------------------------- #
+# Executive investment report (printable dark-mode HTML)
+# --------------------------------------------------------------------------- #
+def build_executive_report_html(
+    *,
+    title: str,
+    base_currency: str,
+    generated_at: str,
+    pnl: dict,
+    ef_chart_html: str = "",
+    donut_chart_html: str = "",
+    basket_df: pd.DataFrame | None = None,
+    extra_note: str = "",
+) -> str:
+    """Assemble a self-contained, printable dark-mode HTML report.
+
+    Pure string assembly (no Streamlit / network) so it is fully unit-testable;
+    chart HTML fragments are produced by the caller via ``fig.to_html(...)``.
+    """
+    sym = {"USD": "$", "EUR": "€"}.get((base_currency or "USD").upper(), "$")
+
+    def money(value) -> str:
+        try:
+            return f"{sym}{float(value):,.0f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    total_value = pnl.get("total_value", 0.0)
+    total_pnl = pnl.get("total_pnl", 0.0)
+    pnl_pct = pnl.get("pnl_pct", 0.0)
+    tone = "pos" if (total_pnl or 0) >= 0 else "neg"
+
+    if basket_df is not None and not basket_df.empty:
+        basket_html = basket_df.to_html(index=False, border=0, classes="tbl")
+    else:
+        basket_html = "<p class='muted'>No trades to stage — portfolio within tolerance.</p>"
+
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  :root {{ --bg:#0e1117; --card:#1a1d24; --border:#2a2e39; --text:#e6e9ef;
+           --muted:#8b95a5; --green:#2ecc71; --red:#e74c3c; }}
+  * {{ box-sizing:border-box; }}
+  body {{ background:var(--bg); color:var(--text); font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+          margin:0; padding:32px; }}
+  h1 {{ font-size:1.6rem; margin:0 0 4px; }}
+  h2 {{ font-size:1.1rem; margin:28px 0 12px; border-bottom:1px solid var(--border); padding-bottom:6px; }}
+  .muted {{ color:var(--muted); font-size:.85rem; }}
+  .cards {{ display:flex; gap:16px; flex-wrap:wrap; margin:18px 0; }}
+  .card {{ background:var(--card); border:1px solid var(--border); border-radius:14px;
+           padding:16px 20px; min-width:190px; }}
+  .card .label {{ color:var(--muted); font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; }}
+  .card .value {{ font-size:1.5rem; font-weight:700; margin-top:6px; }}
+  .card.pos .value {{ color:var(--green); }} .card.neg .value {{ color:var(--red); }}
+  .card.pos {{ border-left:4px solid var(--green); }} .card.neg {{ border-left:4px solid var(--red); }}
+  table.tbl {{ width:100%; border-collapse:collapse; font-size:.9rem; }}
+  table.tbl th, table.tbl td {{ border:1px solid var(--border); padding:8px 10px; text-align:left; }}
+  table.tbl th {{ background:#20242d; color:var(--muted); text-transform:uppercase; font-size:.72rem; }}
+  .chart {{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:8px; margin:8px 0; }}
+  @media print {{ body {{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }} }}
+</style></head>
+<body>
+  <h1>{title}</h1>
+  <div class="muted">Generated {generated_at} · Base currency {base_currency} · {extra_note}</div>
+  <h2>Portfolio P&amp;L</h2>
+  <div class="cards">
+    <div class="card"><div class="label">Portfolio Value</div><div class="value">{money(total_value)}</div></div>
+    <div class="card {tone}"><div class="label">Unrealised P/L</div><div class="value">{money(total_pnl)} ({pnl_pct:+.1f}%)</div></div>
+    <div class="card"><div class="label">Invested Cost Basis</div><div class="value">{money(pnl.get('total_cost', 0.0))}</div></div>
+  </div>
+  <h2>Efficient Frontier</h2>
+  <div class="chart">{ef_chart_html}</div>
+  <h2>Custodian Allocation</h2>
+  <div class="chart">{donut_chart_html}</div>
+  <h2>IBKR Basket Trader — Actionable Orders</h2>
+  {basket_html}
+  <p class="muted" style="margin-top:28px">Educational tool. Not investment advice.</p>
+</body></html>"""
