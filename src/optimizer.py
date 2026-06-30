@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 from pypfopt import EfficientFrontier, expected_returns, risk_models
 from pypfopt.black_litterman import (
+    BlackLittermanModel,
     market_implied_prior_returns,
     market_implied_risk_aversion,
 )
@@ -157,6 +158,46 @@ def black_litterman_implied_returns(
     return prior.reindex(cov.index)
 
 
+@dataclass
+class MarketView:
+    """A user view: ``ticker`` outperforms the benchmark by ``excess_return``
+    (annualised, decimal) with ``confidence`` in ``[0, 1]`` (Idzorek)."""
+
+    ticker: str
+    excess_return: float
+    confidence: float = 0.5
+
+
+def black_litterman_posterior_returns(
+    cov: pd.DataFrame,
+    benchmark_prices: pd.Series,
+    risk_free_rate: float,
+    views: list["MarketView"],
+    frequency: int = TRADING_DAYS_PER_YEAR,
+    market_caps: pd.Series | dict | None = None,
+) -> pd.Series:
+    """Black-Litterman posterior returns blending the equilibrium prior with the
+    user's absolute views (``benchmark_return + excess``) under Idzorek
+    confidences. Raises on failure so the caller can fall back cleanly.
+    """
+    valid = [v for v in views if v.ticker in cov.index and abs(v.excess_return) > 0]
+    if not valid:
+        raise ValueError("No applicable market views for the current universe.")
+
+    prior = black_litterman_implied_returns(
+        cov, benchmark_prices, risk_free_rate, frequency, market_caps)
+    bench_return = float(expected_returns.mean_historical_return(
+        benchmark_prices.to_frame(name="_bm"), frequency=frequency).iloc[0])
+
+    absolute_views = {v.ticker: bench_return + float(v.excess_return) for v in valid}
+    confidences = [float(min(max(v.confidence, 0.01), 0.99)) for v in valid]
+
+    bl = BlackLittermanModel(
+        cov, pi=prior, absolute_views=absolute_views, omega="idzorek",
+        view_confidences=confidences, risk_free_rate=risk_free_rate)
+    return bl.bl_returns().reindex(cov.index)
+
+
 def compute_expected_returns(
     prices: pd.DataFrame,
     cov: pd.DataFrame,
@@ -165,19 +206,37 @@ def compute_expected_returns(
     risk_free_rate: float = 0.0,
     frequency: int = TRADING_DAYS_PER_YEAR,
     market_caps: pd.Series | dict | None = None,
+    views: list["MarketView"] | None = None,
 ) -> tuple[pd.Series, str, str | None]:
     """Compute expected returns under the selected model.
 
-    Returns ``(mu, model_used, note)`` where ``model_used`` may differ from the
-    request (e.g. Black-Litterman falls back to historical when no benchmark is
-    available or the estimation fails), and ``note`` explains any fallback.
+    Returns ``(mu, model_used, note)``. Active ``views`` engage the
+    Black-Litterman posterior (regardless of the toggle); without views the
+    behaviour matches the ``returns_model`` selection. Every Black-Litterman path
+    degrades cleanly to historical returns on failure / missing benchmark.
     """
     historical = expected_returns.mean_historical_return(prices, frequency=frequency)
+    has_benchmark = benchmark_prices is not None and len(benchmark_prices) >= 2
+
+    # ---- Active user views -> Black-Litterman posterior ----
+    active_views = [v for v in (views or []) if v.ticker in cov.index
+                    and abs(v.excess_return) > 0]
+    if active_views:
+        if not has_benchmark:
+            return (historical, "historical",
+                    "Black-Litterman views need a benchmark; used historical returns.")
+        try:
+            mu = black_litterman_posterior_returns(
+                cov, benchmark_prices, risk_free_rate, active_views, frequency, market_caps)
+            return mu, "black_litterman_views", None
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            return (historical, "historical",
+                    f"Black-Litterman views failed ({exc}); used historical returns.")
 
     if returns_model != "black_litterman":
         return historical, "historical", None
 
-    if benchmark_prices is None or len(benchmark_prices) < 2:
+    if not has_benchmark:
         return (historical, "historical",
                 "Black-Litterman needs a benchmark; used historical returns instead.")
 
@@ -223,6 +282,45 @@ def correlation_from_covariance(cov: pd.DataFrame) -> pd.DataFrame:
     with np.errstate(divide="ignore", invalid="ignore"):
         corr = np.where(denom > 0, cov.values / denom, 0.0)
     return pd.DataFrame(corr, index=cov.index, columns=cov.columns)
+
+
+def stress_correlation_convergence(
+    cov: pd.DataFrame,
+    multiplier: float = 1.4,
+    cap: float = 0.99,
+    asset_types: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Systemic-crisis stress: inflate off-diagonal correlations toward +1.
+
+    Volatilities are preserved; every off-diagonal correlation between
+    equity/risk assets is multiplied by ``multiplier`` and clipped to
+    ``±cap``. Pairs involving a bond/fixed-income asset are left unstressed when
+    ``asset_types`` is supplied. Degrades to the input matrix on any failure.
+    """
+    try:
+        std = np.sqrt(np.clip(np.diag(cov.to_numpy()), 0.0, None))
+        denom = np.outer(std, std)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            corr = np.where(denom > 0, cov.to_numpy() / denom, 0.0)
+
+        assets = list(cov.index)
+        is_bond = {a: ("bond" in str((asset_types or {}).get(a, "")).lower())
+                   for a in assets}
+        n = len(assets)
+        stressed = corr.copy()
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                if asset_types is not None and (is_bond[assets[i]] or is_bond[assets[j]]):
+                    continue  # only equity/risk pairs converge
+                stressed[i, j] = float(np.clip(corr[i, j] * multiplier, -cap, cap))
+
+        new_cov = stressed * denom
+        np.fill_diagonal(new_cov, np.diag(cov.to_numpy()))  # preserve variances
+        return pd.DataFrame(new_cov, index=cov.index, columns=cov.columns)
+    except Exception:  # noqa: BLE001 - graceful fallback to the baseline matrix
+        return cov
 
 
 # --------------------------------------------------------------------------- #
@@ -624,19 +722,25 @@ def analyse(
     anchor: AnchorConstraint | None = None,
     sector_map: dict[str, str] | None = None,
     sector_max: float = 1.0,
+    views: list["MarketView"] | None = None,
+    stress_correlation: bool = False,
+    asset_types: dict[str, str] | None = None,
 ) -> FrontierResult:
     """Run a full MPT analysis on a price history.
 
     Single entry point the UI calls; it wires together input estimation, the
     named optimal portfolios (subject to the per-asset cap, the core anchor and
     the sector guardrails), the frontier curve, the Monte-Carlo cloud, the
-    benchmark point and any model-fallback notes.
+    benchmark point and any model-fallback notes. Optional Black-Litterman
+    ``views`` and a systemic ``stress_correlation`` regime are applied here.
     """
     cov = estimate_covariance(prices, cov_method=cov_method)
+    if stress_correlation:
+        cov = stress_correlation_convergence(cov, asset_types=asset_types)
     mu, model_used, note = compute_expected_returns(
         prices, cov, returns_model=returns_model,
         benchmark_prices=benchmark_prices, risk_free_rate=risk_free_rate,
-        market_caps=market_caps,
+        market_caps=market_caps, views=views,
     )
     corr = correlation_from_covariance(cov)
 
@@ -656,6 +760,10 @@ def analyse(
         if benchmark_prices is not None and benchmark_ticker else None
 
     notes = [note] if note else []
+    if stress_correlation:
+        notes.append("⚠️ Systemic Liquidity Crisis stress active — equity/risk "
+                     "correlations inflated ×1.4 (cap 0.99); volatilities & MC are "
+                     "under the stressed regime.")
 
     return FrontierResult(
         mu=mu,
@@ -837,6 +945,87 @@ def simulate_gbm_wealth(
         n_paths=int(n_paths),
         total_contributed=float(initial_capital) + float(monthly_contribution) * steps,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Reverse Monte-Carlo: financial goal targeting
+# --------------------------------------------------------------------------- #
+@dataclass
+class GoalAnalysis:
+    """Probability of reaching a wealth goal and the savings gap to close it."""
+
+    target_wealth: float
+    horizon_years: float
+    prob_success: float
+    median_terminal: float
+    current_monthly: float
+    required_monthly: float
+    additional_monthly: float
+    success_threshold: float
+
+
+def _median_terminal_wealth(initial: float, drift: float, steps: int,
+                            monthly: float) -> float:
+    """Deterministic median GBM path terminal value (median step factor)."""
+    growth = float(np.exp(drift))
+    wealth = float(initial)
+    for _ in range(steps):
+        wealth = wealth * growth + monthly
+    return wealth
+
+
+def gbm_goal_analysis(
+    initial_capital: float,
+    mu: float,
+    sigma: float,
+    horizon_years: float,
+    monthly_contribution: float,
+    target_wealth: float,
+    n_paths: int = GBM_N_PATHS,
+    steps_per_year: int = GBM_STEPS_PER_YEAR,
+    seed: int | None = 11,
+    success_threshold: float = 0.85,
+) -> GoalAnalysis:
+    """Reverse Monte-Carlo: probability of crossing ``target_wealth`` within the
+    horizon, plus the extra monthly saving needed to lift the median path to the
+    goal when success is below ``success_threshold``.
+    """
+    steps = max(int(round(horizon_years * steps_per_year)), 1)
+    dt = 1.0 / steps_per_year
+    drift = (mu - 0.5 * sigma ** 2) * dt
+    diffusion = sigma * float(np.sqrt(dt))
+
+    try:
+        rng = np.random.default_rng(seed)
+        wealth = np.full(n_paths, float(initial_capital), dtype=float)
+        reached = wealth >= target_wealth
+        for _ in range(steps):
+            z = rng.standard_normal(n_paths)
+            wealth = wealth * np.exp(drift + diffusion * z) + monthly_contribution
+            reached |= wealth >= target_wealth
+        prob = float(reached.mean())
+        median_terminal = float(np.median(wealth))
+    except Exception:  # noqa: BLE001 - degrade gracefully
+        prob, median_terminal = float("nan"), float("nan")
+
+    # Solve the monthly contribution whose median path reaches the target.
+    required_monthly = float(monthly_contribution)
+    if _median_terminal_wealth(initial_capital, drift, steps, monthly_contribution) < target_wealth:
+        lo, hi = monthly_contribution, max(monthly_contribution, 1.0) + target_wealth
+        for _ in range(80):
+            mid = (lo + hi) / 2.0
+            if _median_terminal_wealth(initial_capital, drift, steps, mid) >= target_wealth:
+                hi = mid
+            else:
+                lo = mid
+        required_monthly = hi
+
+    return GoalAnalysis(
+        target_wealth=float(target_wealth), horizon_years=float(horizon_years),
+        prob_success=prob, median_terminal=median_terminal,
+        current_monthly=float(monthly_contribution), required_monthly=required_monthly,
+        additional_monthly=max(0.0, required_monthly - monthly_contribution),
+        success_threshold=success_threshold)
 
 
 # --------------------------------------------------------------------------- #

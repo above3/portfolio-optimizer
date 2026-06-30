@@ -356,6 +356,17 @@ class ReallocationResult:
 _HOLD_TOLERANCE = "HOLD / Within Tolerance"
 
 
+def adaptive_tolerance_bands(
+    volatilities: dict[str, float], base_factor: float = 0.2
+) -> dict[str, float]:
+    """Per-asset rebalancing tolerance band ``= base_factor × σ_i``.
+
+    Volatile assets get wider bands (less churn); low-vol bonds get tighter ones.
+    """
+    return {ticker: max(0.0, float(base_factor) * float(sigma))
+            for ticker, sigma in (volatilities or {}).items()}
+
+
 def _knapsack_topup(
     traded: dict[str, float],
     cur: dict[str, float],
@@ -409,6 +420,7 @@ def reallocation_plan(
     asset_types: dict[str, str] | None = None,
     buy_only: bool = False,
     smart_rounding: bool = True,
+    asset_tolerances: dict[str, float] | None = None,
 ) -> ReallocationResult:
     """Build a friction- and tax-aware reallocation plan.
 
@@ -439,7 +451,10 @@ def reallocation_plan(
     cur_w = {t: (cur[t] / investable_capital if investable_capital > 0 else 0.0)
              for t in tickers}
     target_value = {t: tgt_w[t] * investable_capital for t in tickers}
-    within_tol = {t: abs(tgt_w[t] - cur_w[t]) < tolerance for t in tickers}
+    # Per-asset adaptive bands override the scalar tolerance when supplied.
+    asset_tolerances = asset_tolerances or {}
+    within_tol = {t: abs(tgt_w[t] - cur_w[t]) < float(asset_tolerances.get(t, tolerance))
+                  for t in tickers}
 
     # ---- 1. Base integer/fractional trades ----
     traded: dict[str, float] = {}

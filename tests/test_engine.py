@@ -871,3 +871,190 @@ def test_build_executive_report_html():
     assert html.startswith("<!doctype html>")
     assert "EFX" in html and "DNT" in html and "BUY" in html
     assert "#0e1117" in html and "€" in html  # dark palette + EUR symbol
+
+
+# --------------------------------------------------------------------------- #
+# Black-Litterman market-view overrides (posterior returns)
+# --------------------------------------------------------------------------- #
+def test_black_litterman_posterior_shifts_toward_view(prices, inputs):
+    from src.optimizer import (
+        MarketView,
+        black_litterman_implied_returns,
+        black_litterman_posterior_returns,
+    )
+    _, cov = inputs
+    benchmark = prices.mean(axis=1).rename("MKT")
+    # A strong, confident bullish view on CCC should lift its posterior return
+    # above the equilibrium prior (no-view baseline).
+    prior = black_litterman_implied_returns(cov, benchmark, risk_free_rate=0.02)
+    bull_post = black_litterman_posterior_returns(
+        cov, benchmark, risk_free_rate=0.02,
+        views=[MarketView("CCC", 0.20, 0.9)])
+    assert list(bull_post.index) == list(cov.index)
+    assert np.isfinite(bull_post.to_numpy()).all()
+    assert bull_post["CCC"] > prior["CCC"]
+
+
+def test_black_litterman_posterior_requires_a_valid_view(prices, inputs):
+    from src.optimizer import MarketView, black_litterman_posterior_returns
+    _, cov = inputs
+    benchmark = prices.mean(axis=1).rename("MKT")
+    with pytest.raises(Exception):
+        # Ticker not in the covariance universe -> no valid view.
+        black_litterman_posterior_returns(
+            cov, benchmark, risk_free_rate=0.02,
+            views=[MarketView("ZZZ", 0.10, 0.5)])
+
+
+def test_analyse_engages_black_litterman_views(prices):
+    from src.optimizer import MarketView
+    benchmark = prices.mean(axis=1).rename("MKT")
+    result = optimizer.analyse(
+        prices, risk_free_rate=0.02, n_simulations=800,
+        returns_model="historical",
+        benchmark_prices=benchmark, benchmark_ticker="MKT",
+        views=[MarketView("AAA", 0.15, 0.8)])
+    assert result.returns_model == "black_litterman_views"
+    assert np.isfinite(result.mu.to_numpy()).all()
+
+
+def test_analyse_views_fall_back_without_benchmark(prices):
+    from src.optimizer import MarketView
+    # Active views but no benchmark prior -> graceful fallback to historical.
+    result = optimizer.analyse(
+        prices, risk_free_rate=0.02, n_simulations=400,
+        returns_model="historical", benchmark_prices=None,
+        views=[MarketView("AAA", 0.15, 0.8)])
+    assert result.returns_model == "historical"
+    assert result.notes  # a fallback note was recorded
+
+
+def test_marketview_defaults_confidence():
+    from src.optimizer import MarketView
+    v = MarketView("AAA", 0.1)
+    assert v.ticker == "AAA" and v.excess_return == pytest.approx(0.1)
+    assert v.confidence == pytest.approx(0.5)
+
+
+# --------------------------------------------------------------------------- #
+# Regime-shift correlation stress testing
+# --------------------------------------------------------------------------- #
+def test_stress_correlation_inflates_offdiagonals_and_preserves_variance(inputs):
+    from src.optimizer import correlation_from_covariance, stress_correlation_convergence
+    _, cov = inputs
+    stressed = stress_correlation_convergence(cov, multiplier=1.4, cap=0.99)
+    base_corr = correlation_from_covariance(cov).to_numpy()
+    new_corr = correlation_from_covariance(stressed).to_numpy()
+    n = cov.shape[0]
+    # Variances (the diagonal of the covariance) are untouched.
+    assert np.allclose(np.diag(stressed.to_numpy()), np.diag(cov.to_numpy()))
+    # Every positive off-diagonal correlation grew (toward +1), capped at 0.99.
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if base_corr[i, j] > 0:
+                assert new_corr[i, j] >= base_corr[i, j] - 1e-9
+            assert abs(new_corr[i, j]) <= 0.99 + 1e-9
+
+
+def test_stress_correlation_excludes_bonds(inputs):
+    from src.optimizer import correlation_from_covariance, stress_correlation_convergence
+    _, cov = inputs
+    asset_types = {"AAA": "Stock/ETF", "BBB": "Bond/Fixed Income", "CCC": "Stock/ETF"}
+    stressed = stress_correlation_convergence(cov, asset_types=asset_types)
+    base_corr = correlation_from_covariance(cov)
+    new_corr = correlation_from_covariance(stressed)
+    # Pairs touching the bond (BBB) are left unstressed.
+    assert new_corr.loc["AAA", "BBB"] == pytest.approx(base_corr.loc["AAA", "BBB"])
+    assert new_corr.loc["BBB", "CCC"] == pytest.approx(base_corr.loc["BBB", "CCC"])
+    # The pure equity pair still converges.
+    assert new_corr.loc["AAA", "CCC"] >= base_corr.loc["AAA", "CCC"] - 1e-9
+
+
+def test_stress_correlation_degrades_on_bad_input():
+    from src.optimizer import stress_correlation_convergence
+    bad = pd.DataFrame([[float("nan")]], index=["A"], columns=["A"])
+    out = stress_correlation_convergence(bad)
+    assert out.equals(bad)  # returns the input on failure
+
+
+def test_analyse_under_correlation_stress(prices):
+    result = optimizer.analyse(prices, risk_free_rate=0.02, n_simulations=600,
+                               stress_correlation=True,
+                               asset_types={"AAA": "Stock/ETF", "BBB": "Stock/ETF",
+                                            "CCC": "Stock/ETF"})
+    assert any("Systemic Liquidity Crisis" in n for n in result.notes)
+    # Variances preserved -> per-asset volatilities unchanged vs the baseline.
+    base = optimizer.analyse(prices, risk_free_rate=0.02, n_simulations=600)
+    assert np.allclose(np.diag(result.cov.to_numpy()),
+                       np.diag(base.cov.to_numpy()))
+
+
+# --------------------------------------------------------------------------- #
+# Dynamic adaptive rebalancing bands
+# --------------------------------------------------------------------------- #
+def test_adaptive_tolerance_bands_scale_with_volatility():
+    from src.portfolio import adaptive_tolerance_bands
+    bands = adaptive_tolerance_bands({"STOCK": 0.30, "BOND": 0.05}, base_factor=0.2)
+    assert bands["STOCK"] == pytest.approx(0.06)   # 0.2 * 0.30
+    assert bands["BOND"] == pytest.approx(0.01)    # 0.2 * 0.05
+    # The volatile asset gets the wider HOLD band.
+    assert bands["STOCK"] > bands["BOND"]
+    assert adaptive_tolerance_bands({}) == {}
+
+
+def test_reallocation_uses_per_asset_bands(inputs):
+    mu, _ = inputs
+    latest = pd.Series({"AAA": 100.0, "BBB": 100.0})
+    current_values = {"AAA": 4_600.0, "BBB": 5_400.0}
+    target = {"AAA": 0.50, "BBB": 0.50}  # 4% drift on each leg
+    # A wide band on AAA (8%) holds it; a tight band on BBB (1%) trades it.
+    res = reallocation_plan(
+        current_values, target, 10_000.0, latest, mu=mu, tolerance=0.0,
+        asset_tolerances={"AAA": 0.08, "BBB": 0.01})
+    actions = dict(zip(res.table["Ticker"], res.table["Action"]))
+    assert actions["AAA"] == "HOLD / Within Tolerance"
+    assert actions["BBB"] != "HOLD / Within Tolerance"
+
+
+# --------------------------------------------------------------------------- #
+# Smart target savings goal (reverse Monte-Carlo)
+# --------------------------------------------------------------------------- #
+def test_gbm_goal_analysis_probability_and_savings_gap():
+    from src.optimizer import gbm_goal_analysis
+    goal = gbm_goal_analysis(
+        initial_capital=10_000, mu=0.07, sigma=0.15, horizon_years=10,
+        monthly_contribution=200, target_wealth=1_000_000,
+        n_paths=4000, seed=7)
+    # An unreachable goal -> low probability and a required top-up above current.
+    assert 0.0 <= goal.prob_success <= 1.0
+    assert goal.prob_success < goal.success_threshold
+    assert goal.required_monthly > goal.current_monthly
+    assert goal.additional_monthly == pytest.approx(
+        goal.required_monthly - goal.current_monthly)
+    assert goal.additional_monthly > 0
+
+
+def test_gbm_goal_analysis_reachable_goal_needs_no_extra():
+    from src.optimizer import gbm_goal_analysis
+    goal = gbm_goal_analysis(
+        initial_capital=100_000, mu=0.07, sigma=0.12, horizon_years=20,
+        monthly_contribution=500, target_wealth=50_000,
+        n_paths=3000, seed=3)
+    # Already-cleared goal -> high probability, no extra saving required.
+    assert goal.prob_success > 0.85
+    assert goal.additional_monthly == pytest.approx(0.0)
+    assert goal.required_monthly == pytest.approx(goal.current_monthly)
+
+
+def test_gbm_goal_required_monthly_reaches_target_deterministically():
+    from src.optimizer import _median_terminal_wealth, gbm_goal_analysis
+    horizon, spm = 15, 12
+    goal = gbm_goal_analysis(
+        initial_capital=5_000, mu=0.06, sigma=0.18, horizon_years=horizon,
+        monthly_contribution=100, target_wealth=500_000, n_paths=2000, seed=5)
+    steps = horizon * spm
+    drift = (0.06 - 0.5 * 0.18 ** 2) * (1.0 / spm)
+    terminal = _median_terminal_wealth(5_000, drift, steps, goal.required_monthly)
+    assert terminal >= 500_000 - 1.0  # median path lands on (or just above) target

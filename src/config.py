@@ -55,6 +55,13 @@ TAX_RATE_BOND: float = 0.125
 DEFAULT_TOLERANCE_PCT: int = 3      # |w_cur - w_tgt| below this => HOLD
 TOLERANCE_MIN_PCT: int = 1
 TOLERANCE_MAX_PCT: int = 10
+# Dynamic adaptive band: Threshold_i = base_factor * sigma_i (annualised vol).
+DEFAULT_BAND_FACTOR: float = 0.2
+
+# ---- Reverse Monte-Carlo savings goal ------------------------------------ #
+DEFAULT_GOAL_WEALTH: float = 1_000_000.0
+DEFAULT_GOAL_HORIZON_YEARS: int = 20
+GOAL_SUCCESS_THRESHOLD: float = 0.85   # below this -> suggest extra savings
 
 # ---- Sector concentration guardrail -------------------------------------- #
 DEFAULT_SECTOR_MAX_PCT: int = 40

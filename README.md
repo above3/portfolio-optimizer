@@ -61,6 +61,10 @@ Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 | **Cash-inflow drift efficiency monitor** | `optimizer.required_capital_to_align` |
 | **Executive HTML report export** | `portfolio.build_executive_report_html` |
 | **Live snapshot freeze + offline recovery** | `PortfolioStore.save_frozen_snapshot` |
+| **Black-Litterman market-view overrides** (per-ticker excess + confidence) | `optimizer.black_litterman_posterior_returns` |
+| **Regime-shift correlation stress** (×1.4 convergence, vol-preserving) | `optimizer.stress_correlation_convergence` |
+| **Dynamic adaptive rebalancing bands** (`base_factor × σᵢ`) | `portfolio.adaptive_tolerance_bands` |
+| **Smart savings goal** (reverse Monte-Carlo + required-saving solve) | `optimizer.gbm_goal_analysis` |
 
 The chart shows the feasible-set cloud coloured by Sharpe ratio, the efficient
 frontier, the CML, the risk-free point, and star/diamond markers for the MVP,
@@ -200,6 +204,18 @@ All optimisation is **long-only** with an optional per-asset cap
 (`0 ≤ wᵢ ≤ w_max`, no shorting/leverage). The Black-Litterman model replaces the
 historical `μ` with the market-implied equilibrium prior anchored to the
 benchmark.
+
+- **Black-Litterman views**: the equilibrium prior `Π = δΣw_mkt + R_f` is
+  blended with your absolute views (`benchmark return + excess`) under Idzorek
+  confidences to yield the posterior `μ` fed to Max-Sharpe; no views → standard MPT.
+- **Correlation stress**: decompose `Σ → (σ, ρ)`, inflate equity/risk
+  off-diagonals `ρ ← min(1.4·ρ, 0.99)`, then recompose with the **original**
+  variances — diversification collapses while per-asset vol is preserved.
+- **Adaptive bands**: per-asset HOLD tolerance `θᵢ = base_factor · σᵢ`, so
+  volatile assets churn less and low-vol bonds rebalance tighter.
+- **Savings goal (reverse Monte-Carlo)**: `P(success)` is the share of 10 000 GBM
+  paths crossing the target by the horizon; when it falls below 85% a bisection
+  solves the monthly contribution whose **median** path lands on the goal.
 
 ---
 

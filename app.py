@@ -29,11 +29,13 @@ from src.data_loader import iso_timestamp
 from src.optimizer import (
     AnchorConstraint,
     FrontierResult,
+    MarketView,
     PortfolioPoint,
     WatchlistRecommendation,
     analyse,
     backtest_equity_curves,
     buy_only_max_sharpe,
+    gbm_goal_analysis,
     required_capital_to_align,
     screen_watchlist,
     simulate_gbm_wealth,
@@ -43,6 +45,7 @@ from src.portfolio import (
     CurrentPortfolio,
     NoiseReport,
     PortfolioStore,
+    adaptive_tolerance_bands,
     basket_trader_csv,
     build_current_portfolio,
     build_executive_report_html,
@@ -194,8 +197,13 @@ _SETTING_DEFAULTS: dict[str, object] = {
     "pc_deployment": config.DEPLOYMENT_STRATEGIES[0],
     "pc_tranches": config.DEFAULT_TRANCHES,
     "pc_buy_only": False,
+    "pc_stress_corr": False,
+    "pc_dynamic_bands": True,
+    "pc_band_factor": config.DEFAULT_BAND_FACTOR,
     "pc_horizon": config.DEFAULT_HORIZON_YEARS,
     "pc_nsim": config.DEFAULT_N_SIMULATIONS,
+    "pc_goal_wealth": config.DEFAULT_GOAL_WEALTH,
+    "pc_goal_horizon": config.DEFAULT_GOAL_HORIZON_YEARS,
     "pc_watchlist": config.DEFAULT_WATCHLIST,
     "pc_regime": config.MACRO_REGIMES[0],
 }
@@ -290,13 +298,18 @@ def _connect_ibkr(host: str, port: int, client_id: int) -> IBKRNativeProvider:
 def _run_analysis(prices, risk_free_rate, cov_method, n_simulations, max_weight,
                   returns_model, benchmark_prices, benchmark_ticker,
                   anchor_ticker, anchor_weight, anchor_mode,
-                  sector_items, sector_max) -> FrontierResult:
+                  sector_items, sector_max,
+                  view_items=(), stress_correlation=False,
+                  asset_type_items=()) -> FrontierResult:
+    views = [MarketView(t, x, c) for t, x, c in view_items]
     return analyse(
         prices, risk_free_rate=risk_free_rate, cov_method=cov_method,
         n_simulations=n_simulations, max_weight=max_weight, returns_model=returns_model,
         benchmark_prices=benchmark_prices, benchmark_ticker=benchmark_ticker,
         anchor=_make_anchor(anchor_ticker, anchor_weight, anchor_mode),
         sector_map=dict(sector_items), sector_max=sector_max,
+        views=views, stress_correlation=stress_correlation,
+        asset_types=dict(asset_type_items),
     )
 
 
@@ -478,6 +491,45 @@ def _ibkr_connection_panel() -> tuple[bool, int]:
     return True, port
 
 
+def _bl_views_editor() -> list[tuple[str, float, float]]:
+    """Editable Black-Litterman market-views table -> ``[(ticker, excess, conf)]``."""
+    views: list[tuple[str, float, float]] = []
+    with st.sidebar.expander("🧠 Black-Litterman Market Views Overrides"):
+        st.caption("State how each ticker will outperform the benchmark "
+                   "(annualised), with your confidence. Active views engage the "
+                   "Black-Litterman posterior; none → standard MPT.")
+        if "bl_views_df" not in st.session_state:
+            st.session_state.bl_views_df = pd.DataFrame(
+                [{"Ticker": "", "Outperformance %/yr": 0.0, "Confidence %": 50}])
+        edited = st.data_editor(
+            st.session_state.bl_views_df, num_rows="dynamic", use_container_width=True,
+            key="bl_views_editor",
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "Outperformance %/yr": st.column_config.NumberColumn(
+                    "Outperf %/yr", format="%.1f",
+                    help="Annualised excess return vs the benchmark."),
+                "Confidence %": st.column_config.NumberColumn(
+                    "Confidence %", min_value=10, max_value=100, step=5),
+            })
+        st.session_state.bl_views_df = edited
+        for _, row in edited.iterrows():
+            ticker = str(row.get("Ticker", "") or "").strip().upper()
+            try:
+                excess = float(row.get("Outperformance %/yr", 0) or 0) / 100.0
+            except (TypeError, ValueError):
+                excess = 0.0
+            try:
+                conf = float(row.get("Confidence %", 50) or 50) / 100.0
+            except (TypeError, ValueError):
+                conf = 0.5
+            if ticker and abs(excess) > 0:
+                views.append((ticker, excess, max(0.1, min(conf, 1.0))))
+        if views:
+            st.success(f"✅ {len(views)} active view(s) — Black-Litterman posterior engaged.")
+    return views
+
+
 def render_sidebar() -> dict:
     st.sidebar.header("⚙️ Parameters")
     st.sidebar.caption("💾 Settings & holdings auto-save to a local database.")
@@ -520,6 +572,7 @@ def render_sidebar() -> dict:
                                      list(config.RETURNS_MODELS.keys()), key="pc_returns")
     cov_label = st.sidebar.selectbox("Covariance estimator",
                                      list(config.COVARIANCE_METHODS.keys()), key="pc_cov")
+    bl_views = _bl_views_editor()
 
     st.sidebar.markdown("### 🌍 Core global anchor")
     anchor_pct = st.sidebar.slider(
@@ -533,9 +586,32 @@ def render_sidebar() -> dict:
                                        key="pc_max_weight")
     sector_max_pct = st.sidebar.slider("Max Sector Exposure (%)", config.SECTOR_MIN_PCT,
                                        config.SECTOR_MAX_PCT, step=5, key="pc_sector_max")
-    tolerance_pct = st.sidebar.slider("Rebalancing Tolerance Threshold (%)",
-                                      config.TOLERANCE_MIN_PCT, config.TOLERANCE_MAX_PCT,
-                                      step=1, key="pc_tolerance")
+
+    dynamic_bands = st.sidebar.toggle(
+        "Dynamic Adaptive Rebalancing Bands", key="pc_dynamic_bands",
+        help="Per-asset tolerance Threshold_i = Base Factor × σ_i (annualised "
+             "vol): volatile assets get wider bands (less churn), low-vol bonds "
+             "tighter ones. Off → a single static threshold for every asset.")
+    if dynamic_bands:
+        band_factor = st.sidebar.slider(
+            "Adaptive Band Base Factor (× annualised σ)", 0.05, 1.0, step=0.05,
+            key="pc_band_factor")
+        tolerance_pct = config.DEFAULT_TOLERANCE_PCT
+        st.sidebar.caption("ℹ️ Each asset's HOLD band scales with its own volatility.")
+    else:
+        band_factor = float(st.session_state.get("pc_band_factor", config.DEFAULT_BAND_FACTOR))
+        tolerance_pct = st.sidebar.slider("Rebalancing Tolerance Threshold (%)",
+                                          config.TOLERANCE_MIN_PCT, config.TOLERANCE_MAX_PCT,
+                                          step=1, key="pc_tolerance")
+
+    st.sidebar.markdown("### 🧨 Stress testing")
+    stress_correlation = st.sidebar.toggle(
+        "Systemic Liquidity Crisis Shock (Correlation Convergence)",
+        key="pc_stress_corr",
+        help="Inflate every equity/risk off-diagonal correlation ×1.4 (capped "
+             "0.99) while preserving volatilities — diversification collapses as "
+             "in a liquidity crisis. Re-runs volatilities, drawdowns & Monte "
+             "Carlo under the stressed regime. Bonds are left unstressed.")
 
     st.sidebar.markdown("### 💸 Friction")
     disable_fractional = st.sidebar.checkbox("Disable Fractional Shares",
@@ -583,6 +659,8 @@ def render_sidebar() -> dict:
         "anchor_mode": "exact" if anchor_exact else "cap",
         "max_weight": max_weight_pct / 100.0, "sector_max": sector_max_pct / 100.0,
         "tolerance": tolerance_pct / 100.0, "allow_fractional": not disable_fractional,
+        "dynamic_bands": bool(dynamic_bands), "band_factor": float(band_factor),
+        "stress_correlation": bool(stress_correlation), "views": bl_views,
         "transaction_cost": float(transaction_cost), "capital": float(capital),
         "deployment_strategy": deployment_strategy, "tranches": int(tranches),
         "buy_only": bool(buy_only),
@@ -789,7 +867,8 @@ def _render_reallocation(target: PortfolioPoint, current, deployment, latest_pri
             latest_prices=latest_prices, mu=mu, risk_free_rate=params["risk_free_rate"],
             allow_fractional=params["allow_fractional"], transaction_cost=params["transaction_cost"],
             tolerance=params["tolerance"], purchase_prices=current.purchase_prices if current else {},
-            asset_types=asset_types, buy_only=buy_only, smart_rounding=True)
+            asset_types=asset_types, buy_only=buy_only, smart_rounding=True,
+            asset_tolerances=params.get("asset_tolerances"))
         st.dataframe(res.table, hide_index=True, use_container_width=True)
         if not params["allow_fractional"]:
             st.caption(f"🧩 Smart knapsack rounding · residual cash "
@@ -939,6 +1018,65 @@ def _render_montecarlo(result, deployment, params, ccy) -> None:
     c3.metric("Optimistic (P90)", _money(proj.final_p90, ccy))
     st.caption(f"Total contributed over horizon: {_money(proj.total_contributed, ccy)}.")
 
+    _render_goal_targeting(result, initial, monthly, params, ccy)
+
+
+def _render_goal_targeting(result, initial: float, monthly: float, params, ccy: str) -> None:
+    """Reverse Monte-Carlo: probability of hitting a wealth goal + savings gap."""
+    sym = _sym(ccy)
+    with st.container(border=True):
+        st.markdown("### 🎯 Financial Goal Targeting")
+        st.caption("Reverse Monte-Carlo: across 10,000 GBM paths, the probability "
+                   "your wealth crosses a target by a chosen horizon — and, if "
+                   "unlikely, the extra monthly saving needed to get there.")
+        g1, g2 = st.columns(2)
+        target_wealth = g1.number_input(
+            f"Target Wealth Goal ({sym})", min_value=0.0,
+            step=10_000.0, key="pc_goal_wealth")
+        target_horizon = g2.number_input(
+            "Target Horizon (Years)", min_value=1, max_value=config.HORIZON_MAX_YEARS,
+            step=1, key="pc_goal_horizon")
+        if target_wealth <= 0:
+            st.info("Enter a target wealth above zero to compute the success probability.")
+            return
+
+        goal = gbm_goal_analysis(
+            initial_capital=initial, mu=result.tangency.expected_return,
+            sigma=result.tangency.volatility, horizon_years=int(target_horizon),
+            monthly_contribution=monthly, target_wealth=float(target_wealth),
+            success_threshold=config.GOAL_SUCCESS_THRESHOLD)
+
+        if goal.prob_success != goal.prob_success:  # NaN -> degraded gracefully
+            st.warning("⚠️ Goal simulation could not run on the current inputs.")
+            return
+
+        pct = goal.prob_success * 100.0
+        threshold_pct = config.GOAL_SUCCESS_THRESHOLD * 100.0
+        m1, m2 = st.columns(2)
+        tone = "positive" if goal.prob_success >= config.GOAL_SUCCESS_THRESHOLD else "negative"
+        with m1:
+            _card("Probability of Success", f"{pct:.1f}%",
+                  f"of paths reach {_money(target_wealth, ccy)} "
+                  f"within {int(target_horizon)}y", tone)
+        with m2:
+            _card("Median Projected Wealth", _money(goal.median_terminal, ccy),
+                  f"current saving {_money(monthly, ccy)}/mo")
+
+        if goal.prob_success >= config.GOAL_SUCCESS_THRESHOLD:
+            st.success(f"✅ At **{pct:.1f}%** you clear the {threshold_pct:.0f}% confidence "
+                       "bar — your current plan is on track for this goal.")
+        elif goal.additional_monthly > 0:
+            st.error(
+                f"⚠️ Only **{pct:.1f}%** of paths reach the goal (below the "
+                f"{threshold_pct:.0f}% bar). Increase contributions by "
+                f"**{_money(goal.additional_monthly, ccy)}/mo** "
+                f"(to {_money(goal.required_monthly, ccy)}/mo total) to lift the "
+                "median path onto the target.")
+        else:
+            st.warning(f"Only **{pct:.1f}%** of paths reach the goal. The median path "
+                       "already clears it — the shortfall is dispersion/volatility, "
+                       "not the savings rate; consider a longer horizon.")
+
 
 def _record_tranche_controls(current, deployment, ccy: str) -> None:
     """Button to log the active deployment into the PAC tranche ledger."""
@@ -1051,6 +1189,13 @@ def render_results(result, current, noise, deployment, data, params,
                    watchlist_result, asset_types) -> None:
     ccy = params["base_currency"]
     latest_prices = data["latest_prices"]
+
+    # Per-asset adaptive rebalancing bands (Threshold_i = base_factor × σ_i).
+    if params.get("dynamic_bands"):
+        vols = {t: float(max(result.cov.loc[t, t], 0.0)) ** 0.5 for t in result.cov.index}
+        params["asset_tolerances"] = adaptive_tolerance_bands(vols, params["band_factor"])
+    else:
+        params["asset_tolerances"] = None
 
     # ---- Top P&L ledger + behavioral classifier ----
     st.subheader("💹 Real-time P&L & behavioral check")
@@ -1267,7 +1412,10 @@ def main() -> None:
             params["n_simulations"], params["max_weight"], params["returns_model"],
             data["benchmark_prices"], data["benchmark_ticker"],
             eff_anchor, params["anchor_weight"], params["anchor_mode"],
-            sector_items, params["sector_max"])
+            sector_items, params["sector_max"],
+            view_items=tuple(params["views"]),
+            stress_correlation=params["stress_correlation"],
+            asset_type_items=tuple(sorted(asset_types.items())))
         current = build_current_portfolio(shares, data["latest_prices"], result.mu,
                                           result.cov, params["risk_free_rate"],
                                           purchase_prices=purchase_prices)
