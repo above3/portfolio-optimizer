@@ -114,6 +114,11 @@ div[data-testid="stMetricValue"] { font-weight: 700; color: var(--pc-text); }
     padding: 10px 16px; font-weight: 600; }
 .stTabs [aria-selected="true"] { background: var(--pc-card);
     border-bottom: 3px solid var(--pc-accent); }
+/* Per-tab generated description banner */
+.pc-intro { background:#eef4fb; border:1px solid #cfe0f2; border-left:5px solid var(--pc-accent);
+    border-radius:10px; padding:15px 20px; margin:2px 0 22px 0; color:#1c2b3a;
+    font-size:.96rem; line-height:1.6; }
+.pc-intro b { color:#0b3b66; }
 /* Textbook commentary callout */
 .pc-note { background: var(--pc-panel); border: 1px solid var(--pc-border);
     border-left: 5px solid var(--pc-accent); border-radius: 10px;
@@ -143,6 +148,13 @@ def _commentary(title: str, body_md: str) -> None:
     with st.container(border=True):
         st.markdown(f"#### 📘 {title}")
         st.markdown(body_md)
+
+
+def _tab_intro(title: str, description_html: str) -> None:
+    """Render a tab's title plus a generated 'what this screen does' description."""
+    st.markdown(f"## {title}")
+    st.markdown(f'<div class="pc-intro">📖 <b>What this screen shows.</b> '
+                f'{description_html}</div>', unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -986,7 +998,6 @@ def _render_watchlist(base_sharpe, recommendations, anchor_ticker) -> None:
 # --------------------------------------------------------------------------- #
 def _render_backtest(prices, base_pool, current, result, benchmark_prices,
                      benchmark_ticker, risk_free_rate, sectors) -> None:
-    st.subheader("Historical Backtest Analysis")
     regime = st.selectbox("Historical Macro Regime Backtest Simulation",
                           config.MACRO_REGIMES, key="pc_regime",
                           help="Stress-test current vs optimised allocations against "
@@ -1025,7 +1036,6 @@ def _render_backtest(prices, base_pool, current, result, benchmark_prices,
 
 
 def _render_montecarlo(result, deployment, params, ccy) -> None:
-    st.subheader("Monte Carlo Wealth Projection (GBM)")
     if result.tangency is None:
         st.warning("No tangency portfolio to project. Adjust Rf or constraints.")
         return
@@ -1124,7 +1134,6 @@ def _record_tranche_button(current, deployment, ccy: str,
 
 
 def _render_pac_ledger(current, ccy: str) -> None:
-    st.subheader("PAC Performance Ledger — TWR vs MWR")
     store = _get_store()
     history = store.load_tranche_history()
     if history is None or history.empty:
@@ -1244,7 +1253,13 @@ def _render_executive_report(result, current, deployment, latest_prices, params,
 # --------------------------------------------------------------------------- #
 def _tab_composition(current, noise, asset_types: dict, ccy: str) -> None:
     """Tab 1 — current positions grid, custodian donut, P&L and behavioral check."""
-    st.subheader("📋 Portfolio Composition & Real-Time P&L")
+    _tab_intro(
+        "📋 Portfolio Composition & P&L",
+        "This is your <b>live balance sheet</b>. Every position is priced in real time "
+        "and converted to your base currency, so you can see exactly what you own, its "
+        "portfolio weight, its Italian tax treatment and where it is custodied — "
+        "followed by your unrealised profit &amp; loss and a behavioral volatility "
+        "check that flags any holding moving abnormally far from its own history.")
     if current is None or not current.values:
         st.info("No priced holdings detected — you're drafting a fresh portfolio. "
                 "Add positions in the **1 · Your portfolio** grid at the top of the page.")
@@ -1295,8 +1310,14 @@ def _tab_composition(current, noise, asset_types: dict, ccy: str) -> None:
 
 def _tab_frontier(result, current, deployment, latest_prices, params,
                   asset_types: dict, watchlist_result, data: dict, ccy: str) -> None:
-    """Tab 2 — efficient frontier, metric cards, reallocation and forward projection."""
-    st.subheader("📈 Markowitz Efficient Frontier & Capital Market Line")
+    """Tab 2 — efficient frontier, metric cards and reallocation working detail."""
+    _tab_intro(
+        "📈 Markowitz Efficient Frontier",
+        "The <b>heart of Modern Portfolio Theory</b>. This plots every possible "
+        "risk/return trade-off as a cloud, bends the optimal <b>frontier</b> and "
+        "<b>Capital Market Line</b> through it, and marks the two special portfolios — "
+        "<b>Max Sharpe</b> (best reward per unit of risk) and <b>Minimum Variance</b> "
+        "(calmest mix) — then shows exactly how to rebalance your holdings toward them.")
     caption_bits = [f"Returns model: **{result.returns_model.replace('_', ' ').title()}**",
                     f"currency **{ccy}**"]
     if result.max_weight < 1.0:
@@ -1381,22 +1402,15 @@ def _tab_frontier(result, current, deployment, latest_prices, params,
         anchor_ticker = result.anchor.ticker if result.anchor is not None else None
         _render_watchlist(base_sharpe, recs, anchor_ticker)
 
-    st.markdown("---")
-    _render_montecarlo(result, deployment, params, ccy)
-    _commentary(
-        "Why a forward Monte-Carlo lives beside the frontier",
-        "The frontier is a *static snapshot* of today's optimal trade-off. The GBM "
-        "fan chart projects that same tangency portfolio **forward** through 10,000 "
-        "randomised return paths, so the single 'expected return' becomes an honest "
-        "cone of outcomes (P10 pessimistic → P50 median → P90 optimistic). The "
-        "**Financial Goal Targeting** box then runs the logic in reverse: it measures "
-        "the probability of crossing your wealth goal and, when that dips below 85%, "
-        "solves for the extra monthly saving that lifts the median path onto target.")
 
-
-def _tab_risk(result, data: dict, current, params, ccy: str) -> None:
-    """Tab 3 — correlation heatmap, HRP dendrogram and historical stress backtest."""
-    st.subheader("🧬 Risk Clustering & Correlations")
+def _tab_risk(result) -> None:
+    """Tab 3 — correlation heatmap and HRP risk-clustering dendrogram."""
+    _tab_intro(
+        "🧬 Risk Clustering & Correlations",
+        "A <b>diversification x-ray</b>. The heatmap shows how tightly each pair of "
+        "assets moves together, and the dendrogram groups them into a <b>family tree "
+        "of shared risk</b> — revealing hidden concentration that a simple count of "
+        "tickers would completely miss.")
     col_heat, col_tree = st.columns(2)
     with col_heat:
         st.plotly_chart(correlation_heatmap(result.corr),
@@ -1424,19 +1438,59 @@ def _tab_risk(result, data: dict, current, params, ccy: str) -> None:
         "different. Assets that only join high, near the root, are the genuine "
         "diversifiers. Read it to spot risk you *think* is spread out but isn't.")
 
-    st.markdown("---")
+
+def _tab_backtest(result, data: dict, current, params) -> None:
+    """Tab 4 — historical / stress-regime backtest of current vs optimised weights."""
+    _tab_intro(
+        "📉 Historical Backtest & Stress",
+        "A <b>look backwards</b>. This replays your <b>current</b> versus the "
+        "<b>optimised</b> weights across real history — or a synthetic crisis regime — "
+        "as the growth of a single base-100 unit, so you can judge how the allocation "
+        "would actually have behaved through past shocks before you commit to it.")
     _render_backtest(data["prices"], list(result.mu.index), current, result,
                      data["benchmark_prices"], data["benchmark_ticker"],
                      params["risk_free_rate"], data.get("sectors", {}))
     _commentary(
-        "Historical stress & drawdown backtest",
-        "This replays your **current** versus **optimised** weights across the chosen "
-        "window (or a synthetic macro-regime shock) as growth of a base-100 unit. The "
-        "diagnostics table reports **Cumulative Return**, **Annualised Sharpe** and — "
-        "critically — **Max Drawdown**, the worst peak-to-trough fall you would have "
-        "had to stomach. Under the *Systemic Liquidity Crisis* stress, correlations "
-        "are forced toward +1 and diversification evaporates, exposing the true "
-        "black-swan vulnerability the calm-market frontier hides.")
+        "Reading the equity curves & drawdown diagnostics",
+        "- **The chart** rebases every strategy to 100 at the start of the window and "
+        "compounds daily returns forward, so lines that finish higher delivered more "
+        "cumulative growth — but *how* they got there matters as much as where they "
+        "end.\n"
+        "- **The diagnostics table** reports **Cumulative Return**, **Annualised "
+        "Sharpe** (return per unit of risk) and — most importantly — **Max Drawdown**, "
+        "the deepest peak-to-trough fall you would have had to sit through without "
+        "selling. Two portfolios can share a return yet have very different drawdowns; "
+        "the calmer one is usually the one you can actually hold.\n"
+        "- **Under the *Systemic Liquidity Crisis* stress** correlations are forced "
+        "toward +1 and diversification evaporates, exposing the true black-swan "
+        "vulnerability that a calm-market frontier hides.")
+
+
+def _tab_montecarlo(result, deployment, params, ccy: str) -> None:
+    """Tab 5 — forward GBM Monte-Carlo wealth projection + reverse goal targeting."""
+    _tab_intro(
+        "🎲 Monte Carlo Projection",
+        "A <b>look forwards</b>. Ten thousand randomised market futures are simulated "
+        "with Geometric Brownian Motion to turn a single 'expected return' into an "
+        "honest <b>cone of outcomes</b> (pessimistic → median → optimistic). The "
+        "goal-targeting engine then works in reverse to tell you the probability of "
+        "hitting a wealth target — and the extra monthly saving needed if you fall "
+        "short.")
+    _render_montecarlo(result, deployment, params, ccy)
+    _commentary(
+        "How to read the fan chart & goal probability",
+        "- **The fan** widens with time because uncertainty compounds: the shaded band "
+        "spans the 10th-percentile (**pessimistic**) to 90th-percentile "
+        "(**optimistic**) paths, and the solid line is the **median (P50)** outcome. "
+        "It is deliberately not a single number — real markets are a distribution, not "
+        "a promise.\n"
+        "- **Contributions** are added every month, so the projection blends market "
+        "compounding with your disciplined savings.\n"
+        "- **Financial Goal Targeting** runs the simulation in reverse: it counts the "
+        "share of the 10,000 paths that cross your target by the horizon. When that "
+        "probability dips below **85%**, it solves — by bisection — for the additional "
+        "monthly saving that lifts the *median* path back onto the goal, turning a "
+        "vague worry into an exact, actionable number.")
 
 
 def _execution_target(result, current, deployment, params):
@@ -1501,10 +1555,13 @@ def _style_blueprint(blueprint: pd.DataFrame, ccy: str):
 
 def _tab_executive(result, current, deployment, latest_prices, params,
                    asset_types: dict, ccy: str) -> None:
-    """Tab 5 — formal Investment-Committee summary + master execution blueprint."""
-    st.subheader("🏁 Executive Action Report & Blueprint")
-    st.caption("A formal Investment-Committee summary — the single, zero-noise page "
-               "you act from.")
+    """Tab 7 — formal Investment-Committee summary + master execution blueprint."""
+    _tab_intro(
+        "🏁 Executive Action Report",
+        "The <b>action page</b>. A formal, unpadded investment-committee summary of the "
+        "portfolio's health and drift, followed by a single <b>execution blueprint</b> "
+        "listing only the trades you need to place right now — with a one-click basket "
+        "export and tranche logging as the final steps of the cycle.")
 
     target, use_buy_only = _execution_target(result, current, deployment, params)
 
@@ -1594,10 +1651,15 @@ def render_results(result, current, noise, deployment, data, params,
     else:
         params["asset_tolerances"] = None
 
-    tab_comp, tab_frontier, tab_risk, tab_pac, tab_exec = st.tabs([
+    # Clean narrative order: what you hold → optimise → risk structure →
+    # past behaviour → future projection → savings history → act.
+    (tab_comp, tab_frontier, tab_risk, tab_bt,
+     tab_mc, tab_pac, tab_exec) = st.tabs([
         "📋 Portfolio Composition & P&L",
         "📈 Markowitz Efficient Frontier",
         "🧬 Risk Clustering & Correlations",
+        "📉 Historical Backtest",
+        "🎲 Monte Carlo Projection",
         "🧾 Historical PAC Ledger",
         "🏁 Executive Action Report",
     ])
@@ -1610,9 +1672,22 @@ def render_results(result, current, noise, deployment, data, params,
                       asset_types, watchlist_result, data, ccy)
 
     with tab_risk:
-        _tab_risk(result, data, current, params, ccy)
+        _tab_risk(result)
+
+    with tab_bt:
+        _tab_backtest(result, data, current, params)
+
+    with tab_mc:
+        _tab_montecarlo(result, deployment, params, ccy)
 
     with tab_pac:
+        _tab_intro(
+            "🧾 Historical PAC Ledger",
+            "Your real <b>savings-plan track record</b>. Once you log capital tranches, "
+            "this contrasts <b>Time-Weighted Return</b> (the quality of the allocation "
+            "engine, stripped of cash-timing) with <b>Money-Weighted Return</b> (the "
+            "true compounding velocity of your own money) to grade both the strategy "
+            "and your timing.")
         _render_pac_ledger(current, ccy)
 
     with tab_exec:
@@ -1631,10 +1706,10 @@ def main() -> None:
     store = _get_store()
 
     st.title("📈 Portfolio Optimizer — Institutional MPT")
-    st.markdown("A spacious **Financial Research Report**: composition & P&L · "
-                "Markowitz efficient frontier · risk clustering · PAC ledger · a "
-                "formal executive action blueprint. *Open the sidebar (top-left ›) "
-                "to adjust parameters.*")
+    st.markdown("A spacious **Financial Research Report** in seven screens: "
+                "composition & P&L · efficient frontier · risk clustering · historical "
+                "backtest · Monte-Carlo projection · PAC ledger · executive action "
+                "blueprint. *Open the sidebar (top-left ›) to adjust parameters.*")
 
     params = render_sidebar()
 
