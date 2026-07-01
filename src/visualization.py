@@ -15,6 +15,16 @@ import plotly.graph_objects as go
 from .optimizer import BacktestResult, FrontierResult, PortfolioPoint, WealthProjection
 from .portfolio import ClusterTree, CurrentPortfolio
 
+# Anti-friction render config shared by every ``st.plotly_chart`` call: charts
+# stay perfectly static (no scroll-zoom, no drag-pan, no floating mode-bar) while
+# hover tooltips remain fully active. Import and pass as ``config=...``.
+STATIC_PLOT_CONFIG: dict[str, object] = {
+    "scrollZoom": False,
+    "displayModeBar": False,
+    "doubleClick": False,
+    "staticPlot": False,  # keep hover/tooltips alive; only lock navigation
+}
+
 
 def _weights_hover(weights: dict[str, float], top: int = 8) -> str:
     """Render the largest weights as an HTML hover snippet."""
@@ -186,11 +196,13 @@ def efficient_frontier_figure(
         xaxis_title="Annualised volatility (standard deviation) %",
         yaxis_title="Annualised expected return %",
         template="plotly_white",
-        height=620,
+        height=680,
         hovermode="closest",
+        dragmode=False,  # anchor the chart — hover stays, navigation is locked
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-    fig.update_xaxes(rangemode="tozero")
+    fig.update_xaxes(rangemode="tozero", fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
     return fig
 
 
@@ -215,8 +227,12 @@ def correlation_heatmap(corr) -> go.Figure:
     fig.update_layout(
         title="Asset correlation matrix (ρ) — red = diversifying, blue = correlated",
         template="plotly_white",
-        height=460,
-        yaxis=dict(autorange="reversed"),
+        height=620,
+        dragmode=False,
+        # Square, fixed-aspect cells so the matrix reads like a research textbook.
+        yaxis=dict(autorange="reversed", scaleanchor="x", constrain="domain",
+                   fixedrange=True),
+        xaxis=dict(constrain="domain", fixedrange=True),
     )
     return fig
 
@@ -242,9 +258,11 @@ def backtest_figure(backtest: BacktestResult) -> go.Figure:
     fig.update_layout(
         title="Historical Backtest — Growth of a 100 base",
         xaxis_title="Date", yaxis_title="Portfolio value (base = 100)",
-        template="plotly_white", height=520, hovermode="x unified",
+        template="plotly_white", height=560, hovermode="x unified", dragmode=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
+    fig.update_xaxes(fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
     return fig
 
 
@@ -279,9 +297,11 @@ def gbm_fan_chart(projection: WealthProjection, currency_symbol: str = "$") -> g
                f"{projection.n_paths:,} paths"),
         xaxis_title="Years from today",
         yaxis_title=f"Projected wealth ({currency_symbol})",
-        template="plotly_white", height=520, hovermode="x unified",
+        template="plotly_white", height=560, hovermode="x unified", dragmode=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
+    fig.update_xaxes(fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
     return fig
 
 
@@ -297,12 +317,14 @@ def dendrogram_figure(tree: ClusterTree) -> go.Figure:
             x=xs, y=ys, mode="lines", line=dict(color="#1f77b4", width=2),
             hoverinfo="skip", showlegend=False))
     tickvals = [5.0 + 10.0 * i for i in range(len(tree.leaves))]
-    fig.update_xaxes(tickvals=tickvals, ticktext=tree.leaves, tickangle=-30)
+    fig.update_xaxes(tickvals=tickvals, ticktext=tree.leaves, tickangle=-30,
+                     fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
     fig.update_layout(
         title="Hierarchical Risk Clustering Dendrogram — tight branches = shared risk",
         xaxis_title="Holdings grouped by shared systemic risk",
         yaxis_title="Cluster distance √(½(1−ρ))",
-        template="plotly_white", height=440)
+        template="plotly_white", height=520, dragmode=False)
     return fig
 
 
@@ -314,11 +336,11 @@ def custodian_donut(values: dict, currency_symbol: str = "$") -> go.Figure:
     vals = [v for _, v in items] or [1.0]
     fig = go.Figure(data=[go.Pie(
         labels=labels, values=vals, hole=0.55, sort=False,
-        marker=dict(line=dict(color="#0e1117", width=1)),
+        marker=dict(line=dict(color="#ffffff", width=1.5)),
         hovertemplate="%{label}<br>" + currency_symbol +
                       "%{value:,.0f}<br>%{percent}<extra></extra>")])
     fig.update_layout(
         title="Custodian Allocation (by market value)",
-        template="plotly_white", height=380,
+        template="plotly_white", height=420, dragmode=False,
         legend=dict(orientation="v", x=1.0, y=0.5))
     return fig

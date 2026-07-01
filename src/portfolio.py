@@ -739,6 +739,25 @@ def clean_ib_symbol(ticker: str) -> str:
     return map_ibkr_symbol(ticker)
 
 
+# European-listed instruments route through a retail EU broker (Trade Republic);
+# US-listed / SMART-routed tickers execute on the IBKR live desk.
+_TRADE_REPUBLIC_SUFFIXES: frozenset[str] = frozenset(
+    {"DE", "MI", "AS", "PA", "L", "SW", "VI", "BR", "LS", "MC", "HE", "ST", "OL"})
+
+
+def custodian_for(ticker: str) -> str:
+    """Best-effort execution custodian for a ticker (``IBKR Live`` / ``Trade Republic``).
+
+    A European exchange suffix (``.DE``, ``.MI``, …) implies the position is held
+    at Trade Republic; everything else (plain US tickers, SMART routing) is
+    assumed to execute on the Interactive Brokers live desk.
+    """
+    parts = str(ticker).strip().upper().rsplit(".", 1)
+    if len(parts) == 2 and parts[1] in _TRADE_REPUBLIC_SUFFIXES:
+        return "Trade Republic"
+    return "IBKR Live"
+
+
 def basket_trader_csv(realloc: ReallocationResult) -> str:
     """Render the reallocation plan as an IBKR TWS Basket Trader CSV string.
 

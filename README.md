@@ -47,7 +47,10 @@ Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 | **GBM Monte-Carlo wealth projection** (fan chart) | `optimizer.simulate_gbm_wealth` |
 | **IBKR TWS Basket-Trader export** | `portfolio.basket_trader_csv` |
 | **Local persistence** (auto-save holdings/settings) | `portfolio.PortfolioStore` (SQLite) |
-| **Premium dark-mode UI** + neon metric cards | `app.py` (CSS injection) |
+| **High-contrast light "research report" UI** (5 commented tabs) | `app.py` (CSS injection) |
+| **Static, anchored Plotly charts** (zoom/pan locked, hover live) | `visualization.STATIC_PLOT_CONFIG` |
+| **Executive Action Report** + Master Execution blueprint | `app._tab_executive` |
+| **Execution custodian routing** (IBKR Live vs Trade Republic) | `portfolio.custodian_for` |
 | **Optional password gate** | `app.py` (`st.secrets`) |
 | **Buy-only cash allocation** (no-sell rebalancing) | `optimizer.buy_only_max_sharpe` |
 | **Smart knapsack residual-cash rounding** | `portfolio.reallocation_plan` |

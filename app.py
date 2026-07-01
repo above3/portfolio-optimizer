@@ -51,6 +51,7 @@ from src.portfolio import (
     build_executive_report_html,
     classify_noise,
     compute_pac_metrics,
+    custodian_for,
     deployment_plan,
     hierarchical_clusters,
     merge_holdings,
@@ -63,6 +64,7 @@ from src.portfolio import (
 from src.providers import DEFAULT_IBKR_CLIENT_ID, DEFAULT_IBKR_HOST, IBKRNativeProvider, ProviderError
 from src.sample_data import generate_sample_prices, load_prices_from_csv
 from src.visualization import (
+    STATIC_PLOT_CONFIG,
     backtest_figure,
     correlation_heatmap,
     custodian_donut,
@@ -71,51 +73,76 @@ from src.visualization import (
     gbm_fan_chart,
 )
 
-st.set_page_config(page_title="Portfolio Optimizer · MPT", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Portfolio Optimizer · MPT", page_icon="📈",
+                   layout="wide", initial_sidebar_state="collapsed")
 
 
 # --------------------------------------------------------------------------- #
-# Premium institutional dark-mode theme (CSS injection)
+# High-contrast light "research report" theme (CSS injection)
 # --------------------------------------------------------------------------- #
-_DARK_CSS = """
+_LIGHT_CSS = """
 <style>
-:root { --pc-bg:#0e1117; --pc-card:#1a1d24; --pc-border:#2a2e39;
-        --pc-text:#e6e9ef; --pc-muted:#8b95a5; --pc-green:#2ecc71; --pc-red:#e74c3c; }
+:root { --pc-bg:#ffffff; --pc-card:#ffffff; --pc-panel:#f6f8fa; --pc-border:#d7dce3;
+        --pc-text:#111111; --pc-muted:#55606e; --pc-green:#157347; --pc-red:#b02a37;
+        --pc-accent:#0b5cad; }
 .stApp { background-color: var(--pc-bg); color: var(--pc-text); }
-section[data-testid="stSidebar"] { background-color: #14171d; border-right: 1px solid var(--pc-border); }
-h1, h2, h3 { color: var(--pc-text); letter-spacing: .2px; }
+section[data-testid="stSidebar"] { background-color: var(--pc-panel);
+    border-right: 1px solid var(--pc-border); }
+h1, h2, h3, h4 { color: var(--pc-text); letter-spacing: .2px; }
+p, li, label, span, div[data-testid="stMarkdownContainer"] { color: var(--pc-text); }
 /* Native metric cards */
 div[data-testid="stMetric"] {
     background: var(--pc-card); border: 1px solid var(--pc-border);
-    border-radius: 12px; padding: 14px 16px; }
-div[data-testid="stMetricValue"] { font-weight: 700; }
+    border-radius: 12px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(16,24,40,.06); }
+div[data-testid="stMetricValue"] { font-weight: 700; color: var(--pc-text); }
 /* Custom financial cards */
 .pc-card { background: var(--pc-card); border: 1px solid var(--pc-border);
-    border-radius: 14px; padding: 16px 18px; margin-bottom: 10px; }
+    border-radius: 14px; padding: 16px 18px; margin-bottom: 10px;
+    box-shadow: 0 1px 3px rgba(16,24,40,.06); }
 .pc-card .pc-label { color: var(--pc-muted); font-size: .72rem; letter-spacing: .09em;
     text-transform: uppercase; margin-bottom: 6px; }
 .pc-card .pc-value { font-size: 1.55rem; font-weight: 700; color: var(--pc-text); line-height: 1.15; }
 .pc-card .pc-sub { font-size: .82rem; margin-top: 4px; color: var(--pc-muted); }
-.pc-card.pc-pos { border-left: 4px solid var(--pc-green); box-shadow: 0 0 18px rgba(46,204,113,.10); }
+.pc-card.pc-pos { border-left: 4px solid var(--pc-green); }
 .pc-card.pc-pos .pc-value { color: var(--pc-green); }
-.pc-card.pc-neg { border-left: 4px solid var(--pc-red); box-shadow: 0 0 18px rgba(231,76,60,.10); }
+.pc-card.pc-neg { border-left: 4px solid var(--pc-red); }
 .pc-card.pc-neg .pc-value { color: var(--pc-red); }
-.stButton>button, .stDownloadButton>button { border-radius: 10px; border: 1px solid var(--pc-border); font-weight: 600; }
-.stTabs [data-baseweb="tab-list"] { gap: 4px; }
-.stTabs [data-baseweb="tab"] { background: var(--pc-card); border-radius: 8px 8px 0 0; }
+.stButton>button, .stDownloadButton>button { border-radius: 10px;
+    border: 1px solid var(--pc-border); font-weight: 600; }
+.stTabs [data-baseweb="tab-list"] { gap: 6px; }
+.stTabs [data-baseweb="tab"] { background: var(--pc-panel); border-radius: 8px 8px 0 0;
+    padding: 10px 16px; font-weight: 600; }
+.stTabs [aria-selected="true"] { background: var(--pc-card);
+    border-bottom: 3px solid var(--pc-accent); }
+/* Textbook commentary callout */
+.pc-note { background: var(--pc-panel); border: 1px solid var(--pc-border);
+    border-left: 5px solid var(--pc-accent); border-radius: 10px;
+    padding: 14px 18px; margin: 8px 0 20px 0; }
+.pc-note h4 { margin: 0 0 6px 0; color: var(--pc-accent); }
+.pc-note p, .pc-note li { color: #24303f; font-size: .92rem; line-height: 1.55; }
+/* Master execution schema directions */
+.pc-buy { color: var(--pc-green); font-weight: 800; }
+.pc-sell { color: var(--pc-red); font-weight: 800; }
 /* Tranche drift efficiency bar */
-.pc-drift-track { background:#11141b; border:1px solid var(--pc-border); border-radius:999px;
+.pc-drift-track { background:#eef1f5; border:1px solid var(--pc-border); border-radius:999px;
     height:22px; width:100%; overflow:hidden; margin:6px 0; }
-.pc-drift-fill { height:100%; border-radius:999px; text-align:right; color:#08130c;
+.pc-drift-fill { height:100%; border-radius:999px; text-align:right; color:#ffffff;
     font-weight:700; font-size:.74rem; line-height:22px; padding-right:10px;
-    background:linear-gradient(90deg,#27ae60,#2ecc71); }
-.pc-drift-low .pc-drift-fill { background:linear-gradient(90deg,#c0392b,#e74c3c); color:#fff; }
+    background:linear-gradient(90deg,#157347,#1a9950); }
+.pc-drift-low .pc-drift-fill { background:linear-gradient(90deg,#b02a37,#d1434f); color:#fff; }
 </style>
 """
 
 
 def _inject_theme() -> None:
-    st.markdown(_DARK_CSS, unsafe_allow_html=True)
+    st.markdown(_LIGHT_CSS, unsafe_allow_html=True)
+
+
+def _commentary(title: str, body_md: str) -> None:
+    """Render a student-friendly textbook callout beneath a chart or table."""
+    with st.container(border=True):
+        st.markdown(f"#### 📘 {title}")
+        st.markdown(body_md)
 
 
 # --------------------------------------------------------------------------- #
@@ -991,7 +1018,8 @@ def _render_backtest(prices, base_pool, current, result, benchmark_prices,
 
     bt = backtest_equity_curves(bt_prices, weight_sets, risk_free_rate,
                                 benchmark_prices=bench, benchmark_name=benchmark_ticker)
-    st.plotly_chart(backtest_figure(bt), use_container_width=True)
+    st.plotly_chart(backtest_figure(bt), use_container_width=True,
+                    config=STATIC_PLOT_CONFIG)
     st.markdown("**Diagnostics** (frozen weights over the window)")
     st.dataframe(bt.diagnostics, use_container_width=True)
 
@@ -1011,7 +1039,8 @@ def _render_montecarlo(result, deployment, params, ccy) -> None:
                f"μ={result.tangency.expected_return * 100:.1f}% / σ="
                f"{result.tangency.volatility * 100:.1f}% over {params['horizon_years']}y, "
                f"with **{_money(monthly, ccy)}/mo** contributions ({proj.n_paths:,} paths).")
-    st.plotly_chart(gbm_fan_chart(proj, _sym(ccy)), use_container_width=True)
+    st.plotly_chart(gbm_fan_chart(proj, _sym(ccy)), use_container_width=True,
+                    config=STATIC_PLOT_CONFIG)
     c1, c2, c3 = st.columns(3)
     c1.metric("Pessimistic (P10)", _money(proj.final_p10, ccy))
     c2.metric("Median (P50)", _money(proj.final_p50, ccy))
@@ -1078,12 +1107,12 @@ def _render_goal_targeting(result, initial: float, monthly: float, params, ccy: 
                        "not the savings rate; consider a longer horizon.")
 
 
-def _record_tranche_controls(current, deployment, ccy: str) -> None:
-    """Button to log the active deployment into the PAC tranche ledger."""
+def _record_tranche_button(current, deployment, ccy: str,
+                           key: str = "record_tranche") -> None:
+    """Single button that logs the active deployment into the PAC tranche ledger."""
     store = _get_store()
     pv = current.total_value if current is not None else 0.0
-    c1, c2 = st.columns([1, 2])
-    if c1.button("📌 Record this tranche deployment", use_container_width=True,
+    if st.button("📌 Record Tranche Deployment", use_container_width=True, key=key,
                  help="Logs the active capital + portfolio value to the PAC ledger "
                       "for TWR/MWR tracking over time."):
         ok = store.record_tranche(deployment.active_capital, deployment.strategy, pv)
@@ -1092,7 +1121,6 @@ def _record_tranche_controls(current, deployment, ccy: str) -> None:
                        f"at portfolio value {_money(pv, ccy)}.")
         else:
             st.error("Could not write to the local ledger.")
-    c2.caption("Build a Piano di Accumulo (PAC) history to evaluate TWR vs MWR over time.")
 
 
 def _render_pac_ledger(current, ccy: str) -> None:
@@ -1100,9 +1128,24 @@ def _render_pac_ledger(current, ccy: str) -> None:
     store = _get_store()
     history = store.load_tranche_history()
     if history is None or history.empty:
-        st.info("No tranche deployments recorded yet. Use **📌 Record this tranche "
-                "deployment** under *Capital deployment & reallocation* to build the "
+        st.info("No tranche deployments recorded yet. Use **📌 Record Tranche "
+                "Deployment** on the *🏁 Executive Action Report* tab to build the "
                 "savings-plan history, then revisit this tab.")
+        _commentary(
+            "Time-Weighted vs Money-Weighted Return (why both matter)",
+            "This ledger will contrast **two very different truths** about your "
+            "returns once you log a few tranches:\n\n"
+            "- **Time-Weighted Return (TWR)** strips out *when* you added cash. It "
+            "chains each sub-period's growth so a large deposit right before a rally "
+            "cannot flatter the number. TWR answers: *how good is the allocation "
+            "engine itself?* — it is the fair way to grade the strategy.\n"
+            "- **Money-Weighted Return (MWR / IRR)** is the single rate that sets the "
+            "present value of every cash inflow equal to today's portfolio value "
+            "(solved here by **bisection**). It answers: *how fast is my actual money "
+            "compounding?* — it rewards good timing and penalises bad timing.\n\n"
+            "A disciplined **Piano di Accumulo (PAC)** where TWR ≈ MWR means your "
+            "cash-injection timing is neither helping nor hurting the underlying "
+            "engine — the sign of a healthy, unemotional savings plan.")
         return
 
     current_value = current.total_value if current is not None else 0.0
@@ -1129,6 +1172,20 @@ def _render_pac_ledger(current, ccy: str) -> None:
 
     st.markdown("**Capital-inflow history**")
     st.dataframe(history, hide_index=True, use_container_width=True)
+    _commentary(
+        "Reading TWR vs MWR on your real savings plan",
+        f"- **TWR = {metrics.twr_annual * 100:.2f}%** neutralises the *timing* of "
+        "your deposits — it grades the pure quality of the asset allocation, as if "
+        "every euro had been invested from day one.\n"
+        f"- **MWR / IRR = "
+        f"{'n/a' if metrics.mwr_annual != metrics.mwr_annual else f'{metrics.mwr_annual * 100:.2f}%'}** "
+        "is the internal rate of return solved by **bisection** across your actual "
+        "cash-flow dates — it is the true compounding velocity of *your* money.\n\n"
+        "When **MWR > TWR**, your tranche timing added value (you bought more before "
+        "up-moves); when **MWR < TWR**, timing cost you versus simply holding. Over a "
+        f"{metrics.period_years:.1f}-year horizon you contributed "
+        f"{_money(metrics.total_contributed, ccy)} for a total gain of "
+        f"{_money(metrics.total_gain, ccy)}.")
     if st.button("🗑️ Clear PAC ledger"):
         store.clear_tranche_history()
         st.rerun()
@@ -1137,8 +1194,8 @@ def _render_pac_ledger(current, ccy: str) -> None:
 def _render_executive_report(result, current, deployment, latest_prices, params,
                              asset_types) -> None:
     ccy = params["base_currency"]
-    with st.expander("🧾 Executive Investment Report"):
-        st.caption("Compile a printable, dark-mode HTML report (P&L, efficient "
+    with st.expander("🧾 Printable HTML committee report (download / print to PDF)"):
+        st.caption("Compile a self-contained, printable HTML report (P&L, efficient "
                    "frontier, custodian donut, IBKR basket matrix).")
         if st.button("Generate Executive Investment Report", type="secondary"):
             try:
@@ -1185,6 +1242,346 @@ def _render_executive_report(result, current, deployment, latest_prices, params,
 # --------------------------------------------------------------------------- #
 # Top-level results renderer
 # --------------------------------------------------------------------------- #
+def _tab_composition(current, noise, asset_types: dict, ccy: str) -> None:
+    """Tab 1 — current positions grid, custodian donut, P&L and behavioral check."""
+    st.subheader("📋 Portfolio Composition & Real-Time P&L")
+    if current is None or not current.values:
+        st.info("No priced holdings detected — you're drafting a fresh portfolio. "
+                "Add positions in the **1 · Your portfolio** grid at the top of the page.")
+    else:
+        rows = []
+        for t, val in sorted(current.values.items(), key=lambda kv: kv[1], reverse=True):
+            atype = asset_types.get(t, config.DEFAULT_ASSET_TYPE)
+            is_bond = "bond" in atype.lower()
+            rows.append({
+                "Ticker": t,
+                "Shares": round(float(current.shares.get(t, 0.0)), 4),
+                "Market Value": _money(val, ccy),
+                "Weight %": round(current.weights.get(t, 0.0) * 100, 2),
+                "Asset Class": atype,
+                "Italian Tax": "12.5%" if is_bond else "26%",
+                "Custodian": custodian_for(t),
+            })
+        left, right = st.columns([1.4, 1])
+        with left:
+            st.markdown("**Current positions ledger**")
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        with right:
+            st.plotly_chart(custodian_donut(current.values, _sym(ccy)),
+                            use_container_width=True, config=STATIC_PLOT_CONFIG)
+
+    st.markdown("#### 💹 Real-time profit & loss")
+    _pnl_ledger(current, ccy)
+    st.markdown("#### 🧠 Behavioral volatility check")
+    _noise_section(noise)
+
+    _commentary(
+        "How this screen is built",
+        "- **Portfolio value** is a bottom-up sum: each holding's *shares × latest "
+        "price*, all converted into your base display currency via live FX so bonds, "
+        "US equities and European ETFs are directly comparable.\n"
+        "- **Asset Class → Italian tax lens.** Every row is tagged *Stock/ETF* or "
+        "*Bond/Fixed Income*, which sets the capital-gains rate applied later on any "
+        "sale: **26%** on equities/ETFs versus the **12.5%** white-list rate on "
+        "qualifying government bonds. This is why fixed income is cheaper to trim.\n"
+        "- **Custodian** infers the likely venue from the listing suffix — European "
+        "lines (`.DE`, `.MI`, …) route to *Trade Republic*, US/SMART lines to the "
+        "*IBKR Live* desk.\n"
+        "- **Behavioral check** compares each position's current drawdown against its "
+        "own annualised volatility (±1σ). Moves *inside* the band are ordinary market "
+        "noise; moves *beyond* it are flagged statistical outliers worth a deliberate, "
+        "unemotional review rather than a panic sell.")
+
+
+def _tab_frontier(result, current, deployment, latest_prices, params,
+                  asset_types: dict, watchlist_result, data: dict, ccy: str) -> None:
+    """Tab 2 — efficient frontier, metric cards, reallocation and forward projection."""
+    st.subheader("📈 Markowitz Efficient Frontier & Capital Market Line")
+    caption_bits = [f"Returns model: **{result.returns_model.replace('_', ' ').title()}**",
+                    f"currency **{ccy}**"]
+    if result.max_weight < 1.0:
+        caption_bits.append(f"per-asset cap **{result.max_weight * 100:.0f}%**")
+    if result.sector_max < 1.0:
+        caption_bits.append(f"sector cap **{result.sector_max * 100:.0f}%**")
+    if result.anchor is not None and result.anchor.weight > 0:
+        verb = "fixed at" if result.anchor.mode == "exact" else "≤"
+        caption_bits.append(f"anchor **{result.anchor.ticker}** {verb} "
+                            f"**{result.anchor.weight * 100:.0f}%**")
+    st.caption(" · ".join(caption_bits) + ".")
+    for note in result.notes + data.get("notes", []):
+        st.warning(note)
+
+    st.plotly_chart(efficient_frontier_figure(result, current),
+                    use_container_width=True, config=STATIC_PLOT_CONFIG)
+
+    tan_txt = (f"a Sharpe ratio of **{result.tangency.sharpe:.2f}** at "
+               f"{result.tangency.volatility * 100:.1f}% volatility"
+               if result.tangency is not None else "the highest attainable Sharpe ratio")
+    cur_txt = (
+        f"Your **current portfolio** (purple diamond) sits at "
+        f"{current.volatility * 100:.1f}% volatility for a "
+        f"{current.expected_return * 100:.1f}% return (Sharpe "
+        f"{current.sharpe:.2f}). The vertical/horizontal gap to the frontier curve is "
+        "your *inefficiency*: risk you are taking without being paid for it."
+        if current is not None else
+        "Once you hold priced positions, your current portfolio is plotted as a purple "
+        "diamond so you can see how far it sits below the optimal frontier.")
+    _commentary(
+        "Modern Portfolio Theory in one screen",
+        "Markowitz showed that what matters is not each asset in isolation but how "
+        "they **co-move**. Combining imperfectly correlated assets cancels some risk "
+        "'for free', bending a whole *frontier* of best-possible portfolios out of the "
+        "feasible cloud.\n\n"
+        f"- **🚀 Max Sharpe (Tangency)** — the red star, offering {tan_txt}. It is the "
+        "single portfolio where a straight line drawn from the risk-free rate just "
+        "touches the frontier (the **Capital Market Line**); it maximises reward "
+        "*per unit of risk* and is the theoretical optimum for most investors.\n"
+        "- **🛡️ Minimum Variance** — the orange star, the calmest possible mix. It "
+        "accepts lower expected return in exchange for the smallest achievable "
+        "volatility, the natural home for a conservative or near-retirement investor.\n"
+        f"- **📍 Current portfolio.** {cur_txt}\n\n"
+        "Anything *below* the curve is dominated — another portfolio offers more "
+        "return for the same risk, or less risk for the same return.")
+
+    st.markdown("### 🧭 Portfolio comparison")
+    _benchmark_banner(result)
+    _metric_columns(result, current, ccy)
+
+    st.markdown("---")
+    st.subheader("💰 Capital deployment & reallocation (working detail)")
+    _deployment_metrics(deployment, ccy)
+    tab_tan, tab_mvp = st.tabs(["🚀 Max Sharpe (Tangency)", "🛡️ Minimum variance"])
+    with tab_tan:
+        if result.tangency is None:
+            st.warning("Tangency portfolio unavailable at the current Rf.")
+        else:
+            use_buy_only = (params["buy_only"] and current is not None
+                            and deployment.additional_cash > 0)
+            target = result.tangency
+            if use_buy_only:
+                bo = buy_only_max_sharpe(
+                    result.mu, result.cov, current.values, deployment.active_capital,
+                    params["risk_free_rate"], result.max_weight,
+                    result.sector_map, result.sector_max)
+                if bo is not None:
+                    target = bo
+                else:
+                    use_buy_only = False
+                    st.warning("No feasible buy-only target; showing standard rebalance.")
+            _render_reallocation(target, current, deployment, latest_prices,
+                                 result.mu, params, asset_types, result.sector_map,
+                                 ccy, "tan", buy_only=use_buy_only,
+                                 reference_weights=result.tangency.weights)
+    with tab_mvp:
+        _render_reallocation(result.mvp, current, deployment, latest_prices,
+                             result.mu, params, asset_types, result.sector_map, ccy, "mvp")
+
+    if watchlist_result is not None:
+        base_sharpe, recs = watchlist_result
+        anchor_ticker = result.anchor.ticker if result.anchor is not None else None
+        _render_watchlist(base_sharpe, recs, anchor_ticker)
+
+    st.markdown("---")
+    _render_montecarlo(result, deployment, params, ccy)
+    _commentary(
+        "Why a forward Monte-Carlo lives beside the frontier",
+        "The frontier is a *static snapshot* of today's optimal trade-off. The GBM "
+        "fan chart projects that same tangency portfolio **forward** through 10,000 "
+        "randomised return paths, so the single 'expected return' becomes an honest "
+        "cone of outcomes (P10 pessimistic → P50 median → P90 optimistic). The "
+        "**Financial Goal Targeting** box then runs the logic in reverse: it measures "
+        "the probability of crossing your wealth goal and, when that dips below 85%, "
+        "solves for the extra monthly saving that lifts the median path onto target.")
+
+
+def _tab_risk(result, data: dict, current, params, ccy: str) -> None:
+    """Tab 3 — correlation heatmap, HRP dendrogram and historical stress backtest."""
+    st.subheader("🧬 Risk Clustering & Correlations")
+    col_heat, col_tree = st.columns(2)
+    with col_heat:
+        st.plotly_chart(correlation_heatmap(result.corr),
+                        use_container_width=True, config=STATIC_PLOT_CONFIG)
+    with col_tree:
+        tree = hierarchical_clusters(result.corr)
+        if tree is None:
+            st.warning("⚠️ Hierarchical clustering needs ≥3 assets (or the matrix "
+                       "was singular). Showing the heatmap only.")
+        else:
+            st.plotly_chart(dendrogram_figure(tree),
+                            use_container_width=True, config=STATIC_PLOT_CONFIG)
+    _commentary(
+        "Correlation & the 'ancestral tree of risk'",
+        "- **The heatmap** is the correlation matrix ρ. A coefficient near **+1.0** "
+        "(deep blue) means two holdings move almost in lockstep — think two mega-cap "
+        "tech names — so stacking them **doubles the same bet** without adding "
+        "diversification. Coefficients near **0** or **negative** (deep red) — classic "
+        "Gold-versus-Equities behaviour — are the structural shock absorbers: when one "
+        "falls the other holds or rises, smoothing the whole portfolio.\n"
+        "- **The dendrogram** is an *ancestral tree of risk*. It repeatedly marries the "
+        "two most-correlated assets, then the next, drawing a family tree of "
+        "co-movement. **Branches that join low (short links)** are siblings sharing the "
+        "same systemic driver — a hidden concentration even if the tickers look "
+        "different. Assets that only join high, near the root, are the genuine "
+        "diversifiers. Read it to spot risk you *think* is spread out but isn't.")
+
+    st.markdown("---")
+    _render_backtest(data["prices"], list(result.mu.index), current, result,
+                     data["benchmark_prices"], data["benchmark_ticker"],
+                     params["risk_free_rate"], data.get("sectors", {}))
+    _commentary(
+        "Historical stress & drawdown backtest",
+        "This replays your **current** versus **optimised** weights across the chosen "
+        "window (or a synthetic macro-regime shock) as growth of a base-100 unit. The "
+        "diagnostics table reports **Cumulative Return**, **Annualised Sharpe** and — "
+        "critically — **Max Drawdown**, the worst peak-to-trough fall you would have "
+        "had to stomach. Under the *Systemic Liquidity Crisis* stress, correlations "
+        "are forced toward +1 and diversification evaporates, exposing the true "
+        "black-swan vulnerability the calm-market frontier hides.")
+
+
+def _execution_target(result, current, deployment, params):
+    """Resolve the target the blueprint should reach (buy-only aware)."""
+    target = result.tangency or result.mvp
+    use_buy_only = (params["buy_only"] and current is not None
+                    and deployment.additional_cash > 0)
+    if use_buy_only and result.tangency is not None:
+        bo = buy_only_max_sharpe(
+            result.mu, result.cov, current.values, deployment.active_capital,
+            params["risk_free_rate"], result.max_weight,
+            result.sector_map, result.sector_max)
+        if bo is not None:
+            target = bo
+        else:
+            use_buy_only = False
+    return target, use_buy_only
+
+
+def _execution_blueprint_df(res, asset_types: dict, ccy: str) -> pd.DataFrame:
+    """Filter a reallocation plan down to only the actionable BUY/SELL trades."""
+    rows = []
+    for _, r in res.table.iterrows():
+        action = str(r.get("Action", ""))
+        if action not in ("BUY", "SELL"):
+            continue  # drop HOLD / within-tolerance rows entirely
+        shares = r.get("Shares to trade")
+        try:
+            qty = int(round(abs(float(shares))))
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            continue
+        try:
+            cash = abs(float(r.get("Trade Value")))
+        except (TypeError, ValueError):
+            cash = 0.0
+        t = str(r.get("Ticker"))
+        rows.append({
+            "Ticker": t,
+            "Asset Class": asset_types.get(t, config.DEFAULT_ASSET_TYPE),
+            "Custodian": custodian_for(t),
+            "Direction": ("🟢 BUY" if action == "BUY" else "🔴 SELL"),
+            "Exact Target Shares": qty,
+            "Estimated Cash Required": cash,
+        })
+    return pd.DataFrame(rows, columns=[
+        "Ticker", "Asset Class", "Custodian", "Direction",
+        "Exact Target Shares", "Estimated Cash Required"])
+
+
+def _style_blueprint(blueprint: pd.DataFrame, ccy: str):
+    """High-contrast styling: bold green BUY, bold red SELL, localized cash."""
+    def _dir_color(col):
+        return ["color:#157347;font-weight:800" if "BUY" in str(v)
+                else "color:#b02a37;font-weight:800" if "SELL" in str(v)
+                else "" for v in col]
+    return (blueprint.style
+            .apply(_dir_color, subset=["Direction"])
+            .format({"Estimated Cash Required": lambda v: _money(v, ccy)}))
+
+
+def _tab_executive(result, current, deployment, latest_prices, params,
+                   asset_types: dict, ccy: str) -> None:
+    """Tab 5 — formal Investment-Committee summary + master execution blueprint."""
+    st.subheader("🏁 Executive Action Report & Blueprint")
+    st.caption("A formal Investment-Committee summary — the single, zero-noise page "
+               "you act from.")
+
+    target, use_buy_only = _execution_target(result, current, deployment, params)
+
+    # ---- 1. Written executive summary ----
+    n_pos = len([v for v in (current.values.values() if current else []) if v > 0])
+    total_value = current.total_value if current is not None else 0.0
+    lines: list[str] = []
+    if current is not None and result.tangency is not None:
+        te = weight_tracking_error(current.weights, result.tangency.weights)
+        sharpe_gap = result.tangency.sharpe - current.sharpe
+        drift_word = ("well-aligned with" if te < 0.05 else
+                      "moderately drifted from" if te < 0.15 else
+                      "materially drifted from")
+        lines.append(
+            f"The portfolio currently holds **{_money(total_value, ccy)}** across "
+            f"**{n_pos}** priced position(s), and is **{drift_word}** the Max-Sharpe "
+            f"optimum — a weight-space tracking error of **{te * 100:.1f}%**.")
+        if sharpe_gap > 0.01:
+            lines.append(
+                f"Rebalancing toward the tangency node would improve the risk-adjusted "
+                f"Sharpe ratio by **{sharpe_gap:+.2f}** (from {current.sharpe:.2f} to "
+                f"{result.tangency.sharpe:.2f}).")
+        else:
+            lines.append("The current allocation already tracks the optimal frontier "
+                         "closely; only marginal Sharpe improvement is available.")
+    elif current is None:
+        lines.append(
+            f"No existing holdings — this is a clean deployment of "
+            f"**{_money(deployment.active_capital, ccy)}** into the optimised target.")
+    lines.append(
+        f"This cycle deploys **{_money(deployment.active_capital, ccy)}** of active "
+        f"capital under the *{deployment.strategy}* strategy"
+        + (f", holding **{_money(deployment.sidelined_cash, ccy)}** in reserve for "
+           "future tranches." if deployment.sidelined_cash > 0 else "."))
+    if use_buy_only:
+        lines.append("Executed in **buy-only** mode: no sells, so zero realised "
+                     "capital-gains tax and zero sell-side fees.")
+    with st.container(border=True):
+        st.markdown("#### 🧾 Written Executive Summary")
+        for ln in lines:
+            st.markdown("- " + ln)
+
+    # ---- 2. Master Execution Schema (blueprint) ----
+    st.markdown("#### 🧮 The Master Execution Schema")
+    res = reallocation_plan(
+        current_values=current.values if current is not None else {},
+        target_weights=target.weights, investable_capital=deployment.active_capital,
+        latest_prices=latest_prices, mu=result.mu, risk_free_rate=params["risk_free_rate"],
+        allow_fractional=False, transaction_cost=params["transaction_cost"],
+        tolerance=params["tolerance"],
+        purchase_prices=current.purchase_prices if current else {},
+        asset_types=asset_types, buy_only=use_buy_only, smart_rounding=True,
+        asset_tolerances=params.get("asset_tolerances"))
+    blueprint = _execution_blueprint_df(res, asset_types, ccy)
+    if blueprint.empty:
+        st.success("✅ No trades required — every holding sits within its rebalancing "
+                   "band. The portfolio is already aligned to target.")
+    else:
+        st.dataframe(_style_blueprint(blueprint, ccy), hide_index=True,
+                     use_container_width=True)
+        st.caption("Only assets requiring immediate market interaction are listed — "
+                   "within-tolerance holds are filtered out.")
+
+    # ---- 3. Operational bottom bar (definitive final steps) ----
+    st.markdown("#### ⚙️ Execute")
+    b1, b2 = st.columns(2)
+    with b1:
+        st.download_button("📤 Export Basket CSV", basket_trader_csv(res),
+                           file_name="executive_basket_orders.csv", mime="text/csv",
+                           use_container_width=True, key="exec_basket_csv")
+    with b2:
+        _record_tranche_button(current, deployment, ccy, key="exec_record_tranche")
+
+    # ---- 4. Printable HTML committee report ----
+    _render_executive_report(result, current, deployment, latest_prices, params, asset_types)
+
+
 def render_results(result, current, noise, deployment, data, params,
                    watchlist_result, asset_types) -> None:
     ccy = params["base_currency"]
@@ -1197,95 +1594,30 @@ def render_results(result, current, noise, deployment, data, params,
     else:
         params["asset_tolerances"] = None
 
-    # ---- Top P&L ledger + behavioral classifier ----
-    st.subheader("💹 Real-time P&L & behavioral check")
-    _pnl_ledger(current, ccy)
-    _noise_section(noise)
-    _render_executive_report(result, current, deployment, latest_prices, params, asset_types)
+    tab_comp, tab_frontier, tab_risk, tab_pac, tab_exec = st.tabs([
+        "📋 Portfolio Composition & P&L",
+        "📈 Markowitz Efficient Frontier",
+        "🧬 Risk Clustering & Correlations",
+        "🧾 Historical PAC Ledger",
+        "🏁 Executive Action Report",
+    ])
 
-    tab_opt, tab_bt, tab_mc, tab_pac = st.tabs(
-        ["📊 Optimization", "📈 Historical Backtest Analysis",
-         "🎲 Monte Carlo Projection", "🧾 PAC Performance Ledger"])
+    with tab_comp:
+        _tab_composition(current, noise, asset_types, ccy)
 
-    with tab_opt:
-        caption_bits = [f"Returns model: **{result.returns_model.replace('_', ' ').title()}**",
-                        f"currency **{ccy}**"]
-        if result.max_weight < 1.0:
-            caption_bits.append(f"per-asset cap **{result.max_weight * 100:.0f}%**")
-        if result.sector_max < 1.0:
-            caption_bits.append(f"sector cap **{result.sector_max * 100:.0f}%**")
-        if result.anchor is not None and result.anchor.weight > 0:
-            verb = "fixed at" if result.anchor.mode == "exact" else "≤"
-            caption_bits.append(f"anchor **{result.anchor.ticker}** {verb} **{result.anchor.weight * 100:.0f}%**")
-        st.caption(" · ".join(caption_bits) + ".")
-        for note in result.notes + data.get("notes", []):
-            st.warning(note)
+    with tab_frontier:
+        _tab_frontier(result, current, deployment, latest_prices, params,
+                      asset_types, watchlist_result, data, ccy)
 
-        st.plotly_chart(efficient_frontier_figure(result, current), use_container_width=True)
-
-        st.subheader("Portfolio comparison")
-        _benchmark_banner(result)
-        _metric_columns(result, current, ccy)
-
-        st.markdown("---")
-        st.subheader("Capital deployment & reallocation")
-        _deployment_metrics(deployment, ccy)
-        _record_tranche_controls(current, deployment, ccy)
-        tab_tan, tab_mvp = st.tabs(["🚀 Max Sharpe (Tangency)", "🛡️ Minimum variance"])
-        with tab_tan:
-            if result.tangency is None:
-                st.warning("Tangency portfolio unavailable at the current Rf.")
-            else:
-                # Buy-Only: re-solve the no-sell target reachable with new cash.
-                use_buy_only = (params["buy_only"] and current is not None
-                                and deployment.additional_cash > 0)
-                target = result.tangency
-                if use_buy_only:
-                    bo = buy_only_max_sharpe(
-                        result.mu, result.cov, current.values, deployment.active_capital,
-                        params["risk_free_rate"], result.max_weight,
-                        result.sector_map, result.sector_max)
-                    if bo is not None:
-                        target = bo
-                    else:
-                        use_buy_only = False
-                        st.warning("No feasible buy-only target; showing standard rebalance.")
-                _render_reallocation(target, current, deployment, latest_prices,
-                                     result.mu, params, asset_types, result.sector_map,
-                                     ccy, "tan", buy_only=use_buy_only,
-                                     reference_weights=result.tangency.weights)
-        with tab_mvp:
-            _render_reallocation(result.mvp, current, deployment, latest_prices,
-                                 result.mu, params, asset_types, result.sector_map, ccy, "mvp")
-
-        if watchlist_result is not None:
-            base_sharpe, recs = watchlist_result
-            anchor_ticker = result.anchor.ticker if result.anchor is not None else None
-            _render_watchlist(base_sharpe, recs, anchor_ticker)
-
-        st.markdown("---")
-        st.subheader("Diversification — correlation & risk clustering")
-        col_heat, col_tree = st.columns(2)
-        with col_heat:
-            st.plotly_chart(correlation_heatmap(result.corr), use_container_width=True)
-        with col_tree:
-            tree = hierarchical_clusters(result.corr)
-            if tree is None:
-                st.warning("⚠️ Hierarchical clustering needs ≥3 assets (or the matrix "
-                           "was singular). Showing the heatmap only.")
-            else:
-                st.plotly_chart(dendrogram_figure(tree), use_container_width=True)
-
-    with tab_bt:
-        _render_backtest(data["prices"], list(result.mu.index), current, result,
-                         data["benchmark_prices"], data["benchmark_ticker"],
-                         params["risk_free_rate"], data.get("sectors", {}))
-
-    with tab_mc:
-        _render_montecarlo(result, deployment, params, ccy)
+    with tab_risk:
+        _tab_risk(result, data, current, params, ccy)
 
     with tab_pac:
         _render_pac_ledger(current, ccy)
+
+    with tab_exec:
+        _tab_executive(result, current, deployment, latest_prices, params,
+                       asset_types, ccy)
 
 
 # --------------------------------------------------------------------------- #
@@ -1299,9 +1631,10 @@ def main() -> None:
     store = _get_store()
 
     st.title("📈 Portfolio Optimizer — Institutional MPT")
-    st.markdown("Hybrid holdings · VWCE core anchor · sector guardrails · currency "
-                "normalisation · DCA tranches · Italian tax · behavioral P&L · "
-                "backtesting · GBM projection · IBKR export.")
+    st.markdown("A spacious **Financial Research Report**: composition & P&L · "
+                "Markowitz efficient frontier · risk clustering · PAC ledger · a "
+                "formal executive action blueprint. *Open the sidebar (top-left ›) "
+                "to adjust parameters.*")
 
     params = render_sidebar()
 

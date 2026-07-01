@@ -543,6 +543,29 @@ def test_clean_ib_symbol():
     assert clean_ib_symbol("AAPL") == "AAPL"
 
 
+def test_custodian_for_routing():
+    from src.portfolio import custodian_for
+    assert custodian_for("VWCE.DE") == "Trade Republic"   # Xetra
+    assert custodian_for("AGGH.MI") == "Trade Republic"   # Borsa Italiana
+    assert custodian_for("AAPL") == "IBKR Live"           # US / SMART
+    assert custodian_for("BRK.B") == "IBKR Live"          # unknown suffix -> IBKR
+
+
+def test_static_plot_config_locks_navigation():
+    from src.visualization import STATIC_PLOT_CONFIG
+    assert STATIC_PLOT_CONFIG["scrollZoom"] is False
+    assert STATIC_PLOT_CONFIG["displayModeBar"] is False
+    # Charts must stay anchored (fixed ranges) while hover stays alive.
+    prices = _synthetic_prices()
+    from src.visualization import correlation_heatmap, efficient_frontier_figure
+    result = optimizer.analyse(prices, risk_free_rate=0.02, n_simulations=300)
+    ef = efficient_frontier_figure(result)
+    assert ef.layout.dragmode is False
+    assert ef.layout.xaxis.fixedrange is True and ef.layout.yaxis.fixedrange is True
+    heat = correlation_heatmap(result.corr)
+    assert heat.layout.dragmode is False
+
+
 def test_portfolio_config_csv_columns():
     csv_text = portfolio_config_csv({"AAA": 5_000.0}, {"AAA": 0.4, "BBB": 0.6}, 10_000.0,
                                     {"AAA": "Tech", "BBB": "Bond"}, "EUR")

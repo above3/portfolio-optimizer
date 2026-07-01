@@ -1,12 +1,13 @@
-# Streamlit configuration — premium institutional dark theme + Community Cloud
-# server defaults. See https://docs.streamlit.io/develop/api-reference/configuration
+# Streamlit configuration — high-contrast light "research report" theme +
+# Community Cloud server defaults.
+# See https://docs.streamlit.io/develop/api-reference/configuration
 
 [theme]
-base = "dark"
-primaryColor = "#2ecc71"            # muted emerald accent
-backgroundColor = "#0e1117"         # near-black app background
-secondaryBackgroundColor = "#1a1d24"  # card / sidebar background
-textColor = "#e6e9ef"
+base = "light"
+primaryColor = "#0b5cad"            # research-report accent blue
+backgroundColor = "#ffffff"         # crisp white app background
+secondaryBackgroundColor = "#f6f8fa"  # card / sidebar panel
+textColor = "#111111"               # near-black high-legibility text
 font = "sans serif"
 
 [server]
