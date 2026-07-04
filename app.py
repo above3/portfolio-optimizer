@@ -143,11 +143,17 @@ def _inject_theme() -> None:
     st.markdown(_LIGHT_CSS, unsafe_allow_html=True)
 
 
-def _commentary(title: str, body_md: str) -> None:
-    """Render a student-friendly textbook callout beneath a chart or table."""
+def _commentary(title: str, body_md: str, formulas: list[str] | None = None) -> None:
+    """Render a student-friendly textbook callout beneath a chart or table.
+
+    ``formulas`` are optional KaTeX strings rendered with ``st.latex`` *after*
+    the prose, isolated from any literal ``$`` currency symbols in the body.
+    """
     with st.container(border=True):
         st.markdown(f"#### 📘 {title}")
         st.markdown(body_md)
+        for tex in (formulas or []):
+            st.latex(tex)
 
 
 def _tab_intro(title: str, description_html: str) -> None:
@@ -166,6 +172,12 @@ def _sym(currency: str | None) -> str:
 
 def _money(value: float, currency: str | None) -> str:
     return f"{_sym(currency)}{value:,.0f}"
+
+
+def _money_md(value: float, currency: str | None) -> str:
+    """``_money`` with ``$`` escaped so it is safe inside ``st.markdown`` prose
+    (a bare ``$`` there can be mis-parsed as a LaTeX delimiter)."""
+    return _money(value, currency).replace("$", r"\$")
 
 
 def _card(label: str, value: str, sub: str = "", tone: str = "neutral") -> None:
@@ -1181,20 +1193,38 @@ def _render_pac_ledger(current, ccy: str) -> None:
 
     st.markdown("**Capital-inflow history**")
     st.dataframe(history, hide_index=True, use_container_width=True)
+    twr_pct = f"{metrics.twr_annual * 100:.2f}%"
+    mwr_pct = ("n/a" if metrics.mwr_annual != metrics.mwr_annual
+               else f"{metrics.mwr_annual * 100:.2f}%")
     _commentary(
-        "Reading TWR vs MWR on your real savings plan",
-        f"- **TWR = {metrics.twr_annual * 100:.2f}%** neutralises the *timing* of "
-        "your deposits — it grades the pure quality of the asset allocation, as if "
-        "every euro had been invested from day one.\n"
-        f"- **MWR / IRR = "
-        f"{'n/a' if metrics.mwr_annual != metrics.mwr_annual else f'{metrics.mwr_annual * 100:.2f}%'}** "
-        "is the internal rate of return solved by **bisection** across your actual "
-        "cash-flow dates — it is the true compounding velocity of *your* money.\n\n"
-        "When **MWR > TWR**, your tranche timing added value (you bought more before "
-        "up-moves); when **MWR < TWR**, timing cost you versus simply holding. Over a "
-        f"{metrics.period_years:.1f}-year horizon you contributed "
-        f"{_money(metrics.total_contributed, ccy)} for a total gain of "
-        f"{_money(metrics.total_gain, ccy)}.")
+        "Time-Weighted Return (TWR) — grading the strategy",
+        f"Your annualised **TWR is {twr_pct}**. TWR deliberately **neutralises the "
+        "timing of your deposits**. It chops the timeline at every cash-flow date, "
+        "computes the pure investment growth *within* each sub-period, and chain-links "
+        "them by multiplication. Because a fresh deposit lands at the *start* of a new "
+        "link rather than inflating an existing one, a large contribution made right "
+        "before a rally cannot flatter the result. TWR therefore answers one question "
+        "only: **how good is the allocation engine itself?** It is the fair, "
+        "cash-timing-neutral way to grade the strategy — and the standard by which "
+        "professional funds are legally required to advertise performance.",
+        formulas=[r"1 + \text{TWR} = \prod_{k=1}^{n}\big(1 + r_k\big)"])
+    _commentary(
+        "Money-Weighted Return (MWR / IRR) — grading your timing",
+        f"Your annualised **MWR is {mwr_pct}**. MWR is the single discount rate `r` "
+        "that makes the present value of *every* cash flow — each deposit as a "
+        "negative, today's portfolio value as the final positive — sum to exactly "
+        "zero. That is the definition of an **Internal Rate of Return (IRR)**, and "
+        "because the equation has no closed-form solution the app finds it by "
+        "**bisection**: bracket the rate between two bounds, test the midpoint, keep "
+        "the half that changes sign, and repeat until it converges. Unlike TWR, MWR "
+        "*does* reward timing — it measures the true compounding velocity of the actual "
+        "euros/dollars you put in, when you put them in.\n\n"
+        "**Reading the two together:** when **MWR > TWR** your tranche timing *added* "
+        "value (you happened to deploy more before up-moves); when **MWR < TWR** your "
+        "timing *cost* you versus simply drip-feeding on schedule. A disciplined PAC "
+        "where the two sit close together is the sign of an unemotional saver whose "
+        "timing is neither helping nor hurting the underlying engine.",
+        formulas=[r"\sum_{t}\frac{CF_t}{(1+\text{IRR})^{\,t}} = 0"])
     if st.button("🗑️ Clear PAC ledger"):
         store.clear_tranche_history()
         st.rerun()
@@ -1284,28 +1314,86 @@ def _tab_composition(current, noise, asset_types: dict, ccy: str) -> None:
         with right:
             st.plotly_chart(custodian_donut(current.values, _sym(ccy)),
                             use_container_width=True, config=STATIC_PLOT_CONFIG)
+        _commentary(
+            "The positions ledger, column by column",
+            "This table is your **balance sheet**, and every column is a deliberate "
+            "piece of the risk picture:\n\n"
+            "- **Shares** — the raw quantity you hold. On its own it tells you almost "
+            "nothing about risk (10 shares of a €5 bond ETF is tiny; 10 shares of a "
+            "€900 stock is not), which is exactly why the next columns exist.\n"
+            "- **Market Value** — `Shares × latest price`, then translated into your "
+            "base display currency using **live foreign-exchange rates**. This currency "
+            "normalisation is what lets a US-dollar stock, a euro Xetra ETF and an "
+            "Italian bond sit in one comparable column; without it you would be adding "
+            "dollars to euros, a classic beginner error.\n"
+            "- **Weight %** — each holding's market value divided by the *total* "
+            "portfolio value. Weights are the language Modern Portfolio Theory actually "
+            "speaks: the optimiser never asks 'how many shares?', it asks 'what "
+            "fraction of the pie?'. The weights always sum to 100%.\n"
+            "- **Asset Class** — *Stock/ETF* or *Bond/Fixed Income*. Beyond taxes "
+            "(below), this tag also decides whether a holding is inflated during the "
+            "correlation-stress test and how tightly its rebalancing band is drawn.\n"
+            "- **Custodian** — inferred from the listing suffix: European lines "
+            "(`.DE` = Xetra, `.MI` = Borsa Italiana, …) are assumed to sit at "
+            "**Trade Republic**, while plain US/SMART-routed tickers execute on the "
+            "**IBKR Live** desk. This is what the execution blueprint uses to tell you "
+            "*where* to place each order.",
+            formulas=[r"w_i \;=\; \frac{\text{Shares}_i \times P_i^{\text{FX}}}"
+                      r"{\sum_j \text{Shares}_j \times P_j^{\text{FX}}}, "
+                      r"\qquad \sum_i w_i = 1"])
+        _commentary(
+            "Custodian donut — concentration at a glance",
+            "The donut re-plots the **Weight %** column as area. Its real job is to "
+            "expose **concentration**: one slice swallowing half the ring is a "
+            "single-name risk that the flat table can hide. A healthy long-term "
+            "portfolio usually shows several comparably-sized slices rather than one "
+            "dominant wedge — the visual echo of diversification you will quantify "
+            "properly in the *Risk Clustering* tab.")
 
     st.markdown("#### 💹 Real-time profit & loss")
     _pnl_ledger(current, ccy)
+    _commentary(
+        "How your profit & loss is computed",
+        "P&L here is strictly **unrealised** (nothing is sold), and it is built from "
+        "two numbers per holding:\n\n"
+        "- **Cost basis** = `shares × purchase price` — what you originally paid. If "
+        "you never entered a purchase price the app cannot compute P&L and shows "
+        "*n/a* rather than guessing.\n"
+        "- **Market value** = `shares × current price` — what it is worth today.\n\n"
+        "The **unrealised P/L** is simply the gap between them, and the **total return "
+        "%** expresses that gap relative to what you invested — the honest measure of "
+        "performance, because a €1,000 gain means something very different on a €2,000 "
+        "stake than on a €200,000 one. Note this figure is **gross**: the Italian "
+        "capital-gains tax (26% / 12.5%) only bites when you actually *sell*, which is "
+        "why the reallocation and executive tabs re-compute a separate net-of-tax "
+        "number.",
+        formulas=[r"\text{P/L} = \underbrace{(P_{\text{now}}-P_{\text{buy}})\times "
+                  r"\text{shares}}_{\text{gain per holding}}, \qquad "
+                  r"\text{Total Return \%} = \frac{\text{P/L}}"
+                  r"{\text{cost basis}}\times 100"])
     st.markdown("#### 🧠 Behavioral volatility check")
     _noise_section(noise)
-
     _commentary(
-        "How this screen is built",
-        "- **Portfolio value** is a bottom-up sum: each holding's *shares × latest "
-        "price*, all converted into your base display currency via live FX so bonds, "
-        "US equities and European ETFs are directly comparable.\n"
-        "- **Asset Class → Italian tax lens.** Every row is tagged *Stock/ETF* or "
-        "*Bond/Fixed Income*, which sets the capital-gains rate applied later on any "
-        "sale: **26%** on equities/ETFs versus the **12.5%** white-list rate on "
-        "qualifying government bonds. This is why fixed income is cheaper to trim.\n"
-        "- **Custodian** infers the likely venue from the listing suffix — European "
-        "lines (`.DE`, `.MI`, …) route to *Trade Republic*, US/SMART lines to the "
-        "*IBKR Live* desk.\n"
-        "- **Behavioral check** compares each position's current drawdown against its "
-        "own annualised volatility (±1σ). Moves *inside* the band are ordinary market "
-        "noise; moves *beyond* it are flagged statistical outliers worth a deliberate, "
-        "unemotional review rather than a panic sell.")
+        "The behavioral volatility check (±1σ) — fighting panic with statistics",
+        "The single most expensive investing mistake is selling a *normal* wobble as "
+        "if it were a *structural* break. This check draws a statistical fence around "
+        "each holding to tell the two apart.\n\n"
+        "- **σ (sigma)** is the asset's **annualised volatility** — the standard "
+        "deviation of its daily returns scaled up by `√252` (there are ≈252 trading "
+        "days a year, and because independent random shocks add up in *variance*, "
+        "volatility grows with the **square root** of time, not linearly).\n"
+        "- Each position's current drawdown is compared to a **±1σ band**. In a roughly "
+        "bell-shaped return distribution about **68%** of all outcomes fall inside ±1σ, "
+        "so a move *within* the band is statistically ordinary — expected noise, not a "
+        "signal.\n"
+        "- A move **beyond ±1σ** is flagged as a statistical **outlier**: it lands in "
+        "the ~32% tail and genuinely deserves a calm, deliberate review of the thesis "
+        "— which is very different from a reflexive panic sell.\n\n"
+        "In short, the badge converts a gut feeling ('this is crashing!') into a "
+        "probability statement ('this is a 1-in-3 wobble' vs 'this is a real tail "
+        "event').",
+        formulas=[r"\sigma_{\text{annual}} = \sigma_{\text{daily}}\times\sqrt{252}, "
+                  r"\qquad \Pr\big(|r-\mu|<\sigma\big)\approx 68\%"])
 
 
 def _tab_frontier(result, current, deployment, latest_prices, params,
@@ -1348,29 +1436,78 @@ def _tab_frontier(result, current, deployment, latest_prices, params,
         "Once you hold priced positions, your current portfolio is plotted as a purple "
         "diamond so you can see how far it sits below the optimal frontier.")
     _commentary(
-        "Modern Portfolio Theory in one screen",
-        "Markowitz showed that what matters is not each asset in isolation but how "
-        "they **co-move**. Combining imperfectly correlated assets cancels some risk "
-        "'for free', bending a whole *frontier* of best-possible portfolios out of the "
-        "feasible cloud.\n\n"
-        f"- **🚀 Max Sharpe (Tangency)** — the red star, offering {tan_txt}. It is the "
-        "single portfolio where a straight line drawn from the risk-free rate just "
-        "touches the frontier (the **Capital Market Line**); it maximises reward "
-        "*per unit of risk* and is the theoretical optimum for most investors.\n"
-        "- **🛡️ Minimum Variance** — the orange star, the calmest possible mix. It "
-        "accepts lower expected return in exchange for the smallest achievable "
-        "volatility, the natural home for a conservative or near-retirement investor.\n"
+        "Modern Portfolio Theory, from the ground up",
+        "In 1952 Harry Markowitz won a Nobel Prize for one counter-intuitive idea: an "
+        "asset's risk is **not** a property of the asset itself but of how it moves "
+        "*with everything else you own*. Two risky assets that zig and zag at "
+        "different times partly cancel, so the portfolio is calmer than either piece — "
+        "diversification is, in his phrase, 'the only free lunch in finance'.\n\n"
+        "Reading the chart from the raw ingredients:\n"
+        "- **The dots** are thousands of random portfolios (the *feasible set*). Their "
+        "up-down position is **expected return** `μₚ = wᵀμ`; their left-right position "
+        "is **volatility** `σₚ = √(wᵀΣw)`, where `Σ` is the covariance matrix that "
+        "encodes every pairwise co-movement. The colour is each dot's Sharpe ratio.\n"
+        "- **The frontier** (blue curve) is the *upper-left envelope* of that cloud: "
+        "for any given risk it is the highest return reachable. Everything strictly "
+        "*below* it is **dominated** — some other portfolio gives more return for the "
+        "same risk, or the same return for less risk, so no rational investor should "
+        "sit there.\n"
+        f"- **🚀 Max Sharpe (Tangency)** — the red star, offering {tan_txt}. Draw a "
+        "straight line from the risk-free rate `R_f` on the vertical axis; the point "
+        "where it just *touches* the frontier is the tangency portfolio, and that line "
+        "is the **Capital Market Line**. Its slope is the Sharpe ratio — reward per "
+        "unit of risk — and no portfolio of risky assets can beat it. This is the "
+        "theoretical optimum for most investors.\n"
+        "- **🛡️ Minimum Variance** — the orange star at the extreme left tip of the "
+        "frontier: the single calmest mix that exists, accepting lower return for the "
+        "smallest achievable volatility. It is the natural home for a conservative or "
+        "near-retirement investor who prizes stability over growth.\n"
         f"- **📍 Current portfolio.** {cur_txt}\n\n"
-        "Anything *below* the curve is dominated — another portfolio offers more "
-        "return for the same risk, or less risk for the same return.")
+        "All weights are **long-only** (`0 ≤ wᵢ ≤ w_max`, no shorting or leverage), so "
+        "the frontier respects the same real-world constraints your broker does.",
+        formulas=[r"\mu_p = \mathbf{w}^\top\boldsymbol{\mu}, \qquad "
+                  r"\sigma_p = \sqrt{\mathbf{w}^\top\Sigma\,\mathbf{w}}, \qquad "
+                  r"\text{Sharpe} = \frac{\mu_p - R_f}{\sigma_p}"])
 
     st.markdown("### 🧭 Portfolio comparison")
     _benchmark_banner(result)
     _metric_columns(result, current, ccy)
+    _commentary(
+        "Reading the three metric cards",
+        "The cards line up your **Current** portfolio against the two optimised "
+        "targets so the trade-off is explicit. Three numbers matter:\n\n"
+        "- **Expected return** — the weighted average of each holding's forecast "
+        "annual return. It is a *forecast*, not a guarantee, derived from the returns "
+        "model named in the caption above.\n"
+        "- **Volatility** — annualised standard deviation of the portfolio, the "
+        "single-number summary of how bumpy the ride is. Lower is calmer.\n"
+        "- **Sharpe ratio** — `(return − R_f) / volatility`, the *efficiency* score. "
+        "It answers the only question that really matters: **how much extra return am "
+        "I paid for each unit of risk I take?** A portfolio with lower raw return but "
+        "a higher Sharpe is usually the smarter hold, because you can always dial risk "
+        "up or down along the Capital Market Line but you can rarely buy efficiency.\n\n"
+        "The small **coloured deltas** show the change versus your current portfolio — "
+        "green where the optimised target improves the metric, and note that a *lower* "
+        "volatility is the improvement there (hence its inverted colour).")
 
     st.markdown("---")
     st.subheader("💰 Capital deployment & reallocation (working detail)")
     _deployment_metrics(deployment, ccy)
+    _commentary(
+        "Capital deployment — lump sum vs DCA tranches",
+        "Before any trade, the engine decides *how much* cash is in play right now:\n\n"
+        "- **Total capital wealth pool** = current portfolio value + all the new cash "
+        "you entered. It is the full pie the target weights are applied to.\n"
+        "- **Deployed in current tranche** = the slice actually invested this round. "
+        "Under **Lump Sum** this is everything at once; under **DCA / tranches** the "
+        "new cash is sliced into equal periodic instalments.\n"
+        "- **Sidelined cash reserve** = the instalments held back for future tranches.\n\n"
+        "**Why tranche at all?** Dollar-Cost Averaging spreads the entry over time, so "
+        "you buy more units when prices are low and fewer when high, mechanically "
+        "lowering your average cost and removing the emotional agony of trying to time "
+        "a single perfect entry. The trade-off is that, on average, markets rise, so "
+        "sidelined cash gives up some expected return — DCA buys *behavioural "
+        "smoothness and regret-minimisation*, not higher expected wealth.")
     tab_tan, tab_mvp = st.tabs(["🚀 Max Sharpe (Tangency)", "🛡️ Minimum variance"])
     with tab_tan:
         if result.tangency is None:
@@ -1396,11 +1533,43 @@ def _tab_frontier(result, current, deployment, latest_prices, params,
     with tab_mvp:
         _render_reallocation(result.mvp, current, deployment, latest_prices,
                              result.mu, params, asset_types, result.sector_map, ccy, "mvp")
+    _commentary(
+        "How to read the reallocation plan",
+        "Each row turns the abstract target weight into a concrete order, and the "
+        "engine is deliberately **friction-aware** because trading is not free:\n\n"
+        "- **Δ Weight %** is the drift between where a holding *is* and where it "
+        "*should be*. A holding is only traded when that drift breaks its **rebalancing "
+        "band**; anything inside is marked *HOLD*, because churning a 0.3% drift burns "
+        "fees and tax for no real benefit. With **dynamic bands** on, each asset's "
+        "threshold is `base_factor × σᵢ`, so a jumpy equity gets a wide band (fewer "
+        "needless trades) while a placid bond gets a tight one.\n"
+        "- **Fees** accrue per executed trade; **Cap-gains tax** is charged only on the "
+        "*gain* portion of a **sell** (26% equity / 12.5% bond), never on a buy.\n"
+        "- **Gross vs Net return** — the gross figure is the target's expected return; "
+        "the net figure subtracts the tax-and-fee **friction drag**, showing what you "
+        "actually keep. The gap is the real cost of rebalancing.\n"
+        "- **Buy-Only mode** (if enabled) forbids every sell, so the plan drifts you "
+        "toward the target using *new cash only* — zero realised gains, zero "
+        "capital-gains tax. The **drift efficiency** bar then scores how much of the "
+        "remaining misalignment this cash-only tranche removes.\n"
+        "- In whole-share mode a **knapsack** routine spends leftover cash on the "
+        "shares that most reduce tracking error, so residual cash is driven toward "
+        "zero rather than left idle.")
 
     if watchlist_result is not None:
         base_sharpe, recs = watchlist_result
         anchor_ticker = result.anchor.ticker if result.anchor is not None else None
         _render_watchlist(base_sharpe, recs, anchor_ticker)
+        _commentary(
+            "The diversification scanner",
+            "Each watchlist candidate is added to your optimised portfolio one at a "
+            "time and the frontier is re-solved. The verdict is **not** whether the "
+            "candidate has a high return on its own, but whether it lifts the whole "
+            "portfolio's **Max Sharpe** — which it does mainly by having *low "
+            "correlation* to what you already own. A mediocre asset that zigs when your "
+            "book zags can raise risk-adjusted return more than a brilliant asset that "
+            "simply doubles an existing bet. The **avg |ρ|** column is the tell: the "
+            "lower it is, the more genuine diversification the name brings.")
 
 
 def _tab_risk(result) -> None:
@@ -1424,19 +1593,45 @@ def _tab_risk(result) -> None:
             st.plotly_chart(dendrogram_figure(tree),
                             use_container_width=True, config=STATIC_PLOT_CONFIG)
     _commentary(
-        "Correlation & the 'ancestral tree of risk'",
-        "- **The heatmap** is the correlation matrix ρ. A coefficient near **+1.0** "
-        "(deep blue) means two holdings move almost in lockstep — think two mega-cap "
-        "tech names — so stacking them **doubles the same bet** without adding "
-        "diversification. Coefficients near **0** or **negative** (deep red) — classic "
-        "Gold-versus-Equities behaviour — are the structural shock absorbers: when one "
-        "falls the other holds or rises, smoothing the whole portfolio.\n"
-        "- **The dendrogram** is an *ancestral tree of risk*. It repeatedly marries the "
-        "two most-correlated assets, then the next, drawing a family tree of "
-        "co-movement. **Branches that join low (short links)** are siblings sharing the "
-        "same systemic driver — a hidden concentration even if the tickers look "
-        "different. Assets that only join high, near the root, are the genuine "
-        "diversifiers. Read it to spot risk you *think* is spread out but isn't.")
+        "The correlation coefficient ρ, explained properly",
+        "Correlation `ρ` measures how two assets move *relative to each other*, on a "
+        "fixed scale from **−1 to +1**. It is the covariance between them normalised by "
+        "the product of their volatilities, which strips out the size of each asset and "
+        "leaves only the *direction and tightness* of their co-movement:\n\n"
+        "- **ρ ≈ +1.0** (deep blue) — the two move in near-lockstep. Think two mega-cap "
+        "tech names or two S&P 500 ETFs: holding both is essentially **the same bet "
+        "twice**, adding position count but almost no diversification.\n"
+        "- **ρ ≈ 0** — the two are statistically unrelated; each carries its own "
+        "independent risk, which is already helpful.\n"
+        "- **ρ < 0** (deep red) — the two lean in *opposite* directions, the classic "
+        "Gold-versus-Equities relationship. These are the structural **shock "
+        "absorbers**: when one leg falls the other tends to hold or rise, damping the "
+        "swings of the whole portfolio.\n\n"
+        "Why it matters mathematically: portfolio variance is `wᵀΣw`, and every "
+        "off-diagonal term carries a `ρᵢⱼ`. Lowering those correlations directly "
+        "shrinks portfolio volatility for the *same* holdings — the precise mechanism "
+        "behind Markowitz's 'free lunch'.",
+        formulas=[r"\rho_{ij} = \frac{\operatorname{Cov}(r_i, r_j)}"
+                  r"{\sigma_i\,\sigma_j} \in [-1,\,+1]"])
+    _commentary(
+        "The dendrogram — an 'ancestral tree of risk'",
+        "Where the heatmap shows every pair in isolation, the dendrogram reveals the "
+        "*group* structure. It is built by **hierarchical clustering**: convert each "
+        "correlation into a distance, repeatedly marry the two closest (most "
+        "correlated) assets into a cluster, then the next, until a single family tree "
+        "remains.\n\n"
+        "- **The distance metric** is `d = √(½(1−ρ))`. Two assets with `ρ = 1` sit at "
+        "distance 0 (identical risk); with `ρ = 0` at ≈0.71; with `ρ = −1` at the "
+        "maximum distance 1. So *short links = high correlation*.\n"
+        "- **Branches that merge low (near the floor)** are siblings driven by the same "
+        "systemic force — a hidden concentration even when the tickers look unrelated "
+        "(e.g. three different funds that all secretly track US large-cap tech).\n"
+        "- **Branches that only join high, near the root**, are the genuine "
+        "diversifiers — the assets that march to their own drum.\n\n"
+        "Read it as a warning system: a portfolio that looks spread across ten tickers "
+        "but collapses into one low cluster is, in risk terms, barely diversified at "
+        "all.",
+        formulas=[r"d_{ij} = \sqrt{\tfrac{1}{2}\,(1-\rho_{ij})}"])
 
 
 def _tab_backtest(result, data: dict, current, params) -> None:
@@ -1451,19 +1646,35 @@ def _tab_backtest(result, data: dict, current, params) -> None:
                      data["benchmark_prices"], data["benchmark_ticker"],
                      params["risk_free_rate"], data.get("sectors", {}))
     _commentary(
-        "Reading the equity curves & drawdown diagnostics",
-        "- **The chart** rebases every strategy to 100 at the start of the window and "
-        "compounds daily returns forward, so lines that finish higher delivered more "
-        "cumulative growth — but *how* they got there matters as much as where they "
-        "end.\n"
-        "- **The diagnostics table** reports **Cumulative Return**, **Annualised "
-        "Sharpe** (return per unit of risk) and — most importantly — **Max Drawdown**, "
-        "the deepest peak-to-trough fall you would have had to sit through without "
-        "selling. Two portfolios can share a return yet have very different drawdowns; "
-        "the calmer one is usually the one you can actually hold.\n"
-        "- **Under the *Systemic Liquidity Crisis* stress** correlations are forced "
-        "toward +1 and diversification evaporates, exposing the true black-swan "
-        "vulnerability that a calm-market frontier hides.")
+        "Reading the equity curves",
+        "A backtest freezes today's weights and asks *'what if I had held exactly this "
+        "mix across the window?'*. Every strategy is **rebased to 100** on day one and "
+        "its daily returns are **compounded** (multiplied, not added) forward, so the "
+        "lines are directly comparable regardless of starting capital. A line ending at "
+        "150 means +50% cumulative growth. Crucially, watch the *shape*, not just the "
+        "endpoint: a curve that reaches the same place via a terrifying mid-window "
+        "plunge is a very different lived experience from a smooth climb — and most "
+        "investors sell at the bottom of the plunge, never realising the final return.",
+        formulas=[r"V_t = 100 \times \prod_{k=1}^{t}\big(1 + r_k\big)"])
+    _commentary(
+        "The three diagnostics: return, Sharpe, and Max Drawdown",
+        "- **Cumulative Return %** — total growth over the whole window; the headline "
+        "but the *least* informative number, because it ignores the ride.\n"
+        "- **Annualised Sharpe** — the same efficiency ratio as elsewhere, computed on "
+        "realised daily returns and annualised by `√252`. It rewards *smooth* growth "
+        "and penalises volatility, so it is a far better grade than raw return.\n"
+        "- **Max Drawdown** — the single most important risk number here: the deepest "
+        "peak-to-trough fall inside the window, i.e. the worst loss you would have had "
+        "to endure *without capitulating*. A portfolio with a −55% max drawdown demands "
+        "an iron stomach; one with −20% is genuinely holdable. Two allocations can post "
+        "the identical return yet have wildly different drawdowns — and the calmer one "
+        "is almost always the one you can actually stick with.\n\n"
+        "**Under the *Systemic Liquidity Crisis* stress**, off-diagonal correlations are "
+        "forced toward +1 (capped 0.99) while volatilities are preserved: "
+        "diversification evaporates exactly when you need it, so the stressed curves "
+        "expose the true black-swan drawdown that a calm-market frontier hides.",
+        formulas=[r"\text{MaxDD} = \min_t\!\left(\frac{V_t}"
+                  r"{\max_{s\le t} V_s} - 1\right)"])
 
 
 def _tab_montecarlo(result, deployment, params, ccy: str) -> None:
@@ -1478,19 +1689,41 @@ def _tab_montecarlo(result, deployment, params, ccy: str) -> None:
         "short.")
     _render_montecarlo(result, deployment, params, ccy)
     _commentary(
-        "How to read the fan chart & goal probability",
-        "- **The fan** widens with time because uncertainty compounds: the shaded band "
-        "spans the 10th-percentile (**pessimistic**) to 90th-percentile "
-        "(**optimistic**) paths, and the solid line is the **median (P50)** outcome. "
-        "It is deliberately not a single number — real markets are a distribution, not "
-        "a promise.\n"
-        "- **Contributions** are added every month, so the projection blends market "
-        "compounding with your disciplined savings.\n"
-        "- **Financial Goal Targeting** runs the simulation in reverse: it counts the "
-        "share of the 10,000 paths that cross your target by the horizon. When that "
-        "probability dips below **85%**, it solves — by bisection — for the additional "
-        "monthly saving that lifts the *median* path back onto the goal, turning a "
-        "vague worry into an exact, actionable number.")
+        "Geometric Brownian Motion — the engine under the fan",
+        "Each of the 10,000 paths is a simulated future generated by **Geometric "
+        "Brownian Motion (GBM)**, the same equation that underpins the Nobel-winning "
+        "Black–Scholes model. Every month the wealth is nudged by two forces: a steady "
+        "**drift** (`μ`, the tangency portfolio's expected return) that pushes it "
+        "upward, and a random **diffusion** shock (`σ`, its volatility) drawn from a "
+        "bell curve that can push either way.\n\n"
+        "- Because returns *multiply* rather than add, terminal wealth follows a "
+        "**log-normal** distribution — it cannot go below zero but has a long upper "
+        "tail, which is why the fan is asymmetric.\n"
+        "- The band spans the **10th percentile (pessimistic)** to the **90th "
+        "(optimistic)**, and the solid line is the **median (P50)**. The fan *widens "
+        "with time* because volatility accumulates with `√t` — the further out you "
+        "look, the less certain any single number is. This is the honest antidote to a "
+        "single 'your money will be worth X' promise.\n"
+        "- **Monthly contributions** are injected along every path, so the cone blends "
+        "market compounding with your disciplined savings.",
+        formulas=[r"W_{t+\Delta t} = W_t\,\exp\!\Big[\big(\mu - \tfrac{1}{2}\sigma^2"
+                  r"\big)\Delta t + \sigma\sqrt{\Delta t}\; Z\Big] + C, "
+                  r"\quad Z\sim\mathcal{N}(0,1)"])
+    _commentary(
+        "Financial Goal Targeting — running the simulation in reverse",
+        "Forward Monte-Carlo asks *'where might I end up?'*. Goal targeting flips the "
+        "question to *'what do I need to do to get there?'*:\n\n"
+        "- **Probability of success** = the fraction of the 10,000 paths that touch or "
+        "cross your target wealth by the chosen horizon. 62% means 6,200 of the "
+        "simulated futures made it.\n"
+        "- If that probability sits below the **85%** confidence bar, the engine solves "
+        "for the **extra monthly saving** required to lift the *median* path onto the "
+        "goal. It does this by **bisection** — repeatedly halving a search interval, "
+        "testing whether that contribution reaches target, and narrowing until it "
+        "converges — the same robust root-finding idea used for the IRR in the PAC "
+        "ledger. The output is a single, concrete number: 'save €X more per month'.\n\n"
+        "It converts a vague anxiety ('am I saving enough?') into an actionable, "
+        "quantified plan.")
 
 
 def _execution_target(result, current, deployment, params):
@@ -1576,7 +1809,7 @@ def _tab_executive(result, current, deployment, latest_prices, params,
                       "moderately drifted from" if te < 0.15 else
                       "materially drifted from")
         lines.append(
-            f"The portfolio currently holds **{_money(total_value, ccy)}** across "
+            f"The portfolio currently holds **{_money_md(total_value, ccy)}** across "
             f"**{n_pos}** priced position(s), and is **{drift_word}** the Max-Sharpe "
             f"optimum — a weight-space tracking error of **{te * 100:.1f}%**.")
         if sharpe_gap > 0.01:
@@ -1590,11 +1823,11 @@ def _tab_executive(result, current, deployment, latest_prices, params,
     elif current is None:
         lines.append(
             f"No existing holdings — this is a clean deployment of "
-            f"**{_money(deployment.active_capital, ccy)}** into the optimised target.")
+            f"**{_money_md(deployment.active_capital, ccy)}** into the optimised target.")
     lines.append(
-        f"This cycle deploys **{_money(deployment.active_capital, ccy)}** of active "
+        f"This cycle deploys **{_money_md(deployment.active_capital, ccy)}** of active "
         f"capital under the *{deployment.strategy}* strategy"
-        + (f", holding **{_money(deployment.sidelined_cash, ccy)}** in reserve for "
+        + (f", holding **{_money_md(deployment.sidelined_cash, ccy)}** in reserve for "
            "future tranches." if deployment.sidelined_cash > 0 else "."))
     if use_buy_only:
         lines.append("Executed in **buy-only** mode: no sells, so zero realised "
@@ -1603,6 +1836,22 @@ def _tab_executive(result, current, deployment, latest_prices, params,
         st.markdown("#### 🧾 Written Executive Summary")
         for ln in lines:
             st.markdown("- " + ln)
+    _commentary(
+        "What the summary is measuring",
+        "This paragraph is generated from two diagnostics:\n\n"
+        "- **Tracking error** — the root-mean-square distance, in weight space, between "
+        "your current allocation and the Max-Sharpe target. Think of it as a single "
+        "percentage that answers *'how far off-optimal am I?'*: 2% is a nudge, 15%+ is a "
+        "different portfolio wearing your name. It drives the *well-aligned / "
+        "moderately drifted / materially drifted* verdict.\n"
+        "- **Sharpe gap** — how much risk-adjusted efficiency you would *gain* by "
+        "rebalancing to the tangency node. A large gap justifies paying the fees and "
+        "tax to trade; a near-zero gap means you should probably leave things alone.\n\n"
+        "The final line confirms the **capital being deployed** this cycle and the "
+        "strategy (lump-sum or DCA), so the committee sees exactly how much money is "
+        "moving before approving a single order.",
+        formulas=[r"\text{TE} = \sqrt{\sum_i \big(w_i^{\text{current}} "
+                  r"- w_i^{\text{target}}\big)^2}"])
 
     # ---- 2. Master Execution Schema (blueprint) ----
     st.markdown("#### 🧮 The Master Execution Schema")
@@ -1624,6 +1873,21 @@ def _tab_executive(result, current, deployment, latest_prices, params,
                      use_container_width=True)
         st.caption("Only assets requiring immediate market interaction are listed — "
                    "within-tolerance holds are filtered out.")
+    _commentary(
+        "How to read the execution blueprint",
+        "This is intentionally **stripped to only the actionable trades** — every "
+        "*HOLD* row is filtered out so nothing distracts from what you must actually "
+        "do. Each column is an instruction:\n\n"
+        "- **Direction** — a bold **🟢 BUY** (green) or **🔴 SELL** (red); the colour is "
+        "the fastest possible read of intent.\n"
+        "- **Exact Target Shares** — whole-share, integer-rounded quantities, because "
+        "you cannot place an order for 12.7 shares on most venues.\n"
+        "- **Estimated Cash Required** — the trade's value in your base currency, so "
+        "you can confirm the buys fit the cash you are deploying.\n"
+        "- **Custodian** — *where* to route each order (IBKR Live vs Trade Republic), "
+        "removing the last piece of ambiguity between decision and execution.\n\n"
+        "It is the same friction- and tax-aware plan from the Frontier tab, but "
+        "distilled to a committee-ready order ticket.")
 
     # ---- 3. Operational bottom bar (definitive final steps) ----
     st.markdown("#### ⚙️ Execute")
@@ -1634,6 +1898,11 @@ def _tab_executive(result, current, deployment, latest_prices, params,
                            use_container_width=True, key="exec_basket_csv")
     with b2:
         _record_tranche_button(current, deployment, ccy, key="exec_record_tranche")
+    st.caption("**Export Basket CSV** hands the whole-share orders to IBKR's Basket "
+               "Trader in one file; **Record Tranche Deployment** logs this round's "
+               "capital and portfolio value to the PAC ledger so the TWR/MWR history "
+               "keeps building. Together they close the loop: decide → execute → "
+               "record → measure.")
 
     # ---- 4. Printable HTML committee report ----
     _render_executive_report(result, current, deployment, latest_prices, params, asset_types)
