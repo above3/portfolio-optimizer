@@ -50,6 +50,7 @@ from src.portfolio import (
     build_current_portfolio,
     build_executive_report_html,
     classify_noise,
+    compute_drift,
     compute_pac_metrics,
     custodian_for,
     deployment_plan,
@@ -60,6 +61,7 @@ from src.portfolio import (
     portfolio_config_csv,
     positions_to_holdings_df,
     reallocation_plan,
+    target_weights_from_buckets,
 )
 from src.providers import DEFAULT_IBKR_CLIENT_ID, DEFAULT_IBKR_HOST, IBKRNativeProvider, ProviderError
 from src.sample_data import generate_sample_prices, load_prices_from_csv
@@ -231,7 +233,9 @@ _SETTING_DEFAULTS: dict[str, object] = {
     "pc_ibkr_port": next(iter(config.IBKR_PORT_CHOICES)),
     "pc_currency": config.DEFAULT_BASE_CURRENCY,
     "pc_data_source": "Yahoo Finance (live)",
-    "pc_rf_live": True,
+    # Manual EUR-proxy Rf by default: the live ^IRX fetch is a USD rate, which
+    # is inconsistent with a EUR-denominated portfolio.
+    "pc_rf_live": False,
     "pc_rf_manual": config.DEFAULT_RISK_FREE_RATE * 100,
     "pc_benchmark": config.DEFAULT_BENCHMARK,
     "pc_lookback": config.DEFAULT_LOOKBACK_YEARS,
@@ -242,7 +246,9 @@ _SETTING_DEFAULTS: dict[str, object] = {
     "pc_max_weight": int(config.DEFAULT_MAX_WEIGHT * 100),
     "pc_sector_max": config.DEFAULT_SECTOR_MAX_PCT,
     "pc_tolerance": config.DEFAULT_TOLERANCE_PCT,
-    "pc_disable_fractional": False,
+    "pc_drift_threshold": config.DEFAULT_DRIFT_THRESHOLD_PCT,
+    # Whole shares by default: real broker orders are integer shares.
+    "pc_disable_fractional": True,
     "pc_transaction_cost": config.DEFAULT_TRANSACTION_COST,
     "pc_capital": 0.0,
     "pc_deployment": config.DEPLOYMENT_STRATEGIES[0],
@@ -286,10 +292,11 @@ def _seed_settings(store: PortfolioStore) -> None:
 
 
 def _persist_state(store: PortfolioStore, holdings: pd.DataFrame) -> None:
-    """Auto-commit holdings + settings to the local DB (best-effort)."""
+    """Auto-commit holdings + settings + bucket targets to the DB (best-effort)."""
     try:
         store.save_holdings(holdings)
         store.save_settings({k: st.session_state.get(k) for k in _SETTING_DEFAULTS})
+        store.set("bucket_targets", st.session_state.get("bucket_targets", {}))
     except Exception:  # noqa: BLE001 - persistence must never break the UI
         pass
 
@@ -388,6 +395,12 @@ def _init_state() -> None:
         st.session_state.holdings_df = (
             loaded if loaded is not None and not loaded.empty
             else normalise_holdings_df(pd.DataFrame(config.DEMO_PORTFOLIO)))
+    if "bucket_targets" not in st.session_state:
+        saved = store.get("bucket_targets")
+        st.session_state.bucket_targets = (
+            {str(k): float(v) for k, v in saved.items()}
+            if isinstance(saved, dict) and saved
+            else dict(config.DEFAULT_BUCKET_TARGETS))
     st.session_state.setdefault("editor_version", 0)
     st.session_state.setdefault("ibkr_file_id", None)
     st.session_state.setdefault("ibkr_ingest_id", None)
@@ -477,7 +490,9 @@ def _drift_efficiency_bar(efficiency: float, required_cash: float,
 def _risk_free_controls() -> float:
     fetch_live = st.sidebar.toggle(
         f"Fetch Live Risk-Free Rate ({config.RISK_FREE_TICKER})", key="pc_rf_live",
-        help="Use the US 3-Month T-Bill yield as Rf for the tangency portfolio.")
+        help="Pulls the US 3-Month T-Bill yield — a USD rate. For a EUR "
+             "portfolio the manual EUR short-rate proxy below is the "
+             "consistent choice, so this is OFF by default.")
     if fetch_live:
         try:
             rf = _fetch_live_rf()
@@ -485,8 +500,10 @@ def _risk_free_controls() -> float:
             return rf
         except Exception as exc:  # noqa: BLE001 - blocked network/parse error
             st.sidebar.warning(f"Live rate unavailable ({type(exc).__name__}). Enter manually.")
-    rf_pct = st.sidebar.number_input("Risk-free rate Rf (%)", 0.0, 25.0, step=0.25,
-                                     key="pc_rf_manual")
+    rf_pct = st.sidebar.number_input(
+        "Risk-free rate Rf (%)", 0.0, 25.0, step=0.25, key="pc_rf_manual",
+        help="EUR short-rate proxy (ECB deposit facility / €STR area). Used as "
+             "the zero-risk alternative in every Sharpe ratio and the CML.")
     return rf_pct / 100.0
 
 
@@ -747,11 +764,17 @@ def render_data_input() -> tuple[pd.DataFrame, list[str]]:
     edited = st.data_editor(
         st.session_state.holdings_df, num_rows="dynamic", use_container_width=True,
         column_config={
-            "Ticker": st.column_config.TextColumn("Ticker", help="Yahoo symbol, e.g. AAPL, VWCE.DE, AGGH.MI."),
+            "Ticker": st.column_config.TextColumn("Ticker", help="Yahoo symbol, e.g. VWCE.DE, EIMI.MI, ABT."),
             "Shares": st.column_config.NumberColumn("Shares", help="Units held (0 = watch-only)."),
-            "Purchase Price": st.column_config.NumberColumn("Purchase Price", min_value=0.0, format="%.2f"),
+            "Purchase Price": st.column_config.NumberColumn(
+                "Purchase Price", min_value=0.0, format="%.2f",
+                help="Average cost per share — drives P/L and the capital-gains tax estimate."),
             "Asset Type": st.column_config.SelectboxColumn("Asset Type", options=list(config.ASSET_TYPES),
                                                            default=config.DEFAULT_ASSET_TYPE),
+            "Bucket": st.column_config.SelectboxColumn(
+                "Bucket", options=list(config.BUCKETS), default=config.DEFAULT_BUCKET,
+                help="Which slice of YOUR plan this position belongs to — the "
+                     "Action Plan rebalances toward the bucket targets."),
         },
         key=f"holdings_editor_{st.session_state.editor_version}")
     st.session_state.holdings_df = edited
@@ -763,11 +786,12 @@ def render_data_input() -> tuple[pd.DataFrame, list[str]]:
     return edited, list(dict.fromkeys(watchlist))
 
 
-def _parse_holdings(edited: pd.DataFrame) -> tuple[dict, dict, dict]:
-    """Return ``(shares, purchase_prices, asset_types)`` from the editor frame."""
+def _parse_holdings(edited: pd.DataFrame) -> tuple[dict, dict, dict, dict]:
+    """Return ``(shares, purchase_prices, asset_types, buckets)`` from the editor."""
     shares: dict[str, float] = {}
     purchase_prices: dict[str, float] = {}
     asset_types: dict[str, str] = {}
+    buckets: dict[str, str] = {}
     for _, row in edited.iterrows():
         ticker = str(row.get("Ticker", "") or "").strip().upper()
         if not ticker:
@@ -786,7 +810,242 @@ def _parse_holdings(edited: pd.DataFrame) -> tuple[dict, dict, dict]:
             purchase_prices[ticker] = pp
         atype = str(row.get("Asset Type", config.DEFAULT_ASSET_TYPE) or config.DEFAULT_ASSET_TYPE)
         asset_types[ticker] = atype
-    return shares, purchase_prices, asset_types
+        buckets[ticker] = str(row.get("Bucket", config.DEFAULT_BUCKET)
+                              or config.DEFAULT_BUCKET)
+    return shares, purchase_prices, asset_types, buckets
+
+
+def _render_target_editor() -> dict[str, float]:
+    """Editable bucket-target table (the user's plan). Returns {bucket: pct}."""
+    with st.expander("🎯 My target allocation (buckets)", expanded=False):
+        st.caption("This is **your plan** — the Action Plan rebalances toward these "
+                   "targets, not toward whatever the optimiser fancies. Inside a "
+                   "bucket, the target splits equally across its holdings.")
+        current = st.session_state.get("bucket_targets", dict(config.DEFAULT_BUCKET_TARGETS))
+        rows = [{"Bucket": b, "Target %": float(current.get(b, 0.0))}
+                for b in config.BUCKETS]
+        edited = st.data_editor(
+            pd.DataFrame(rows), hide_index=True, use_container_width=True,
+            key="bucket_targets_editor",
+            column_config={
+                "Bucket": st.column_config.TextColumn("Bucket", disabled=True),
+                "Target %": st.column_config.NumberColumn(
+                    "Target %", min_value=0.0, max_value=100.0, step=1.0,
+                    help="Share of the total portfolio this bucket should hold."),
+            })
+        targets: dict[str, float] = {}
+        for _, row in edited.iterrows():
+            try:
+                targets[str(row["Bucket"])] = float(row["Target %"] or 0.0)
+            except (TypeError, ValueError):
+                targets[str(row["Bucket"])] = 0.0
+        total = sum(targets.values())
+        if abs(total - 100.0) > 0.5:
+            st.warning(f"Targets sum to **{total:.0f}%** — they will be "
+                       "renormalised to 100% automatically.")
+        st.session_state.bucket_targets = targets
+    return targets
+
+
+def _buy_only_headline(res, buckets: dict[str, str], ccy: str) -> list[str]:
+    """Human instructions ('BUY 3 × VWCE.DE ≈ €390 · Trade Republic · Core')."""
+    lines: list[str] = []
+    for _, r in res.table.iterrows():
+        if str(r.get("Action")) != "BUY":
+            continue
+        shares = r.get("Shares to trade")
+        try:
+            qty = int(round(float(shares)))
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
+        t = str(r.get("Ticker"))
+        try:
+            cost = abs(float(r.get("Trade Value")))
+        except (TypeError, ValueError):
+            cost = 0.0
+        lines.append(f"**BUY {qty} × {t} ≈ {_money_md(cost, ccy)}** · "
+                     f"{custodian_for(t)} · {buckets.get(t, config.DEFAULT_BUCKET)}")
+    return lines
+
+
+def _render_assumptions(params, result, threshold_pct: float) -> None:
+    """Every model input, stated explicitly with a one-line 'why'."""
+    with st.expander("🔧 Assumptions used in this run (and why)"):
+        rf = params["risk_free_rate"] * 100
+        rows = [
+            ("Risk-free rate", f"{rf:.2f}%",
+             "EUR short-rate proxy — the zero-risk alternative in Sharpe & CML."
+             if not st.session_state.get("pc_rf_live") else
+             "Live US 3-month T-Bill (^IRX) — note this is a USD rate."),
+            ("Historical lookback", f"{params['lookback']} years",
+             "Window used to estimate returns & covariances; longer = stabler "
+             "but slower to reflect regime change."),
+            ("Return frequency", "Daily closes, annualised ×252",
+             "Standard trading-day annualisation."),
+            ("Covariance estimator",
+             "Ledoit-Wolf shrinkage" if params["cov_method"] == "ledoit_wolf"
+             else "Sample covariance",
+             "Shrinkage pulls extreme correlations toward the mean — far more "
+             "stable on short/mixed histories (recommended default)."),
+            ("Expected returns", result.returns_model.replace("_", " ").title(),
+             "Historical means are noisy; they drive the *research* tabs only — "
+             "your Action Plan targets are your own buckets."),
+            ("Materiality threshold", f"{threshold_pct:.1f}%",
+             "Below this max drift the verdict is NO ACTION — micro-trades burn "
+             "fees and taxes for no benefit."),
+            ("Order sizing", "Whole shares",
+             "Real broker orders are integer shares; residual cash is reported."),
+            ("Within-bucket split", "Equal weight",
+             "A bucket's target divides equally across its holdings — simple, "
+             "legible, and easy to override by editing bucket membership."),
+        ]
+        st.table(pd.DataFrame(rows, columns=["Input", "Value", "Why this value"]))
+        st.caption("⚠️ **Disclaimer**: this tool is a decision-support aid, not "
+                   "financial advice. Expected returns and risk are estimates "
+                   "based on past data and can be substantially wrong.")
+
+
+def _render_action_plan(result, current, deployment, data, params,
+                        asset_types: dict, buckets: dict[str, str]) -> None:
+    """THE answer-first panel: what should I actually do, in shares and euros."""
+    ccy = params["base_currency"]
+    latest_prices = data["latest_prices"]
+    st.markdown("---")
+    st.subheader("✅ Action Plan — what should I do?")
+
+    threshold_pct = float(st.session_state.get(
+        "pc_drift_threshold", config.DEFAULT_DRIFT_THRESHOLD_PCT))
+    c1, c2 = st.columns([1, 2.4])
+    with c1:
+        threshold_pct = st.number_input(
+            "Materiality threshold (%)", 0.5, 10.0, step=0.5, key="pc_drift_threshold",
+            help="Deviations below this are ignored — no micro-trades.")
+    threshold = threshold_pct / 100.0
+
+    # ---- The plan universe: only instruments the user actually declared ----
+    universe = [t for t in result.mu.index if t in buckets]
+    if not universe:
+        st.info("Add at least one holding with a bucket to build an action plan.")
+        return
+    target_weights, plan_notes = target_weights_from_buckets(
+        st.session_state.get("bucket_targets", dict(config.DEFAULT_BUCKET_TARGETS)),
+        buckets, universe)
+
+    current_values = {t: v for t, v in (current.values.items() if current else [])
+                      if t in target_weights}
+    current_total = sum(current_values.values())
+    new_cash = max(deployment.active_capital - current_total, 0.0)
+    current_weights = ({t: v / current_total for t, v in current_values.items()}
+                       if current_total > 0 else {})
+
+    drift = compute_drift(current_weights, target_weights, buckets,
+                          threshold=threshold, notes=plan_notes)
+    with c2:
+        st.metric("Max drift from your plan",
+                  f"{max(drift.max_asset_drift, drift.max_bucket_drift) * 100:.1f}%",
+                  f"threshold {threshold_pct:.1f}%", delta_color="off")
+    for note in drift.notes:
+        st.caption(f"⚠️ {note}")
+
+    # ---- 1. The verdict ----------------------------------------------------
+    if not drift.action_needed and new_cash <= 0:
+        st.success(
+            f"### ✅ NO ACTION NEEDED\n"
+            f"Every position and bucket is within **{threshold_pct:.1f}%** of your "
+            f"plan (max drift {max(drift.max_asset_drift, drift.max_bucket_drift) * 100:.1f}%). "
+            "Trading now would only generate fees and taxes — sit tight.")
+    elif new_cash <= 0:
+        st.warning(
+            f"### ⚠️ Drift {max(drift.max_asset_drift, drift.max_bucket_drift) * 100:.1f}% "
+            f"exceeds your {threshold_pct:.1f}% threshold\n"
+            "You entered **no new cash**. For a buy-and-hold investor the "
+            "cheapest fix is to direct the **next contribution** at the "
+            "underweight buckets (set *Additional capital to invest* in the "
+            "sidebar) instead of selling — selling realises the 26% Italian "
+            "capital-gains tax. A tax-aware full rebalance is available below.")
+    else:
+        # ---- 2. New-cash mode: whole-share BUY list, zero sells ----------
+        res = reallocation_plan(
+            current_values=current_values, target_weights=target_weights,
+            investable_capital=deployment.active_capital,
+            latest_prices=latest_prices, mu=result.mu,
+            risk_free_rate=params["risk_free_rate"],
+            allow_fractional=False,  # broker orders are whole shares
+            transaction_cost=params["transaction_cost"], tolerance=threshold,
+            asset_types=asset_types, buy_only=True, smart_rounding=True)
+        lines = _buy_only_headline(res, buckets, ccy)
+        after = compute_drift(res.achieved_weights, target_weights, buckets,
+                              threshold=threshold)
+        if lines:
+            st.success(f"### 🛒 Deploy {_money_md(new_cash, ccy)} — buy only, no sells, no tax")
+            for ln in lines:
+                st.markdown("- " + ln)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Max drift after buys",
+                      f"{max(after.max_asset_drift, after.max_bucket_drift) * 100:.1f}%",
+                      f"{(max(after.max_asset_drift, after.max_bucket_drift) - max(drift.max_asset_drift, drift.max_bucket_drift)) * 100:+.1f}%",
+                      delta_color="inverse")
+            m2.metric("Residual cash", _money(res.residual_cash, ccy),
+                      "left after whole-share rounding", delta_color="off")
+            m3.metric("Capital-gains tax", _money(0.0, ccy), "no sells → none",
+                      delta_color="off")
+        else:
+            st.success(
+                f"### ✅ NO PURCHASE IS WORTHWHILE\n"
+                f"The {_money_md(new_cash, ccy)} of new cash cannot buy a whole "
+                f"share that moves any position by more than your "
+                f"{threshold_pct:.1f}% threshold — hold the cash for the next "
+                "tranche instead of paying fees on micro-orders.")
+
+    # ---- 3. Drift detail (the numbers behind the verdict) ----
+    with st.expander("📊 Drift detail — current vs target, per bucket and per asset"):
+        st.markdown("**By bucket** (your plan)")
+        st.dataframe(drift.bucket_rows, hide_index=True, use_container_width=True)
+        st.markdown("**By asset** (equal split inside each bucket)")
+        st.dataframe(drift.asset_rows, hide_index=True, use_container_width=True)
+        st.caption("*Drift % = current weight − target weight. Positive = "
+                   "overweight. The Action Plan buys underweights first.*")
+
+    # ---- 4. Full rebalance: only on explicit request, with the tax bill ----
+    with st.expander("🔁 Full rebalance (may SELL — shows the 26% tax bill first)"):
+        st.caption("Selling winners realises Italian capital-gains tax (26%; "
+                   "12.5% white-list bonds). This mode exists for when drift is "
+                   "too large to fix with new cash alone — always compare the "
+                   "tax you pay with the drift you remove.")
+        if st.toggle("Compute the full rebalance plan", key="show_full_rebalance"):
+            res_full = reallocation_plan(
+                current_values=current_values, target_weights=target_weights,
+                investable_capital=deployment.active_capital,
+                latest_prices=latest_prices, mu=result.mu,
+                risk_free_rate=params["risk_free_rate"], allow_fractional=False,
+                transaction_cost=params["transaction_cost"], tolerance=threshold,
+                purchase_prices=current.purchase_prices if current else {},
+                asset_types=asset_types, buy_only=False, smart_rounding=True)
+            after_full = compute_drift(res_full.achieved_weights, target_weights,
+                                       buckets, threshold=threshold)
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Estimated tax on sells", _money(res_full.total_tax, ccy),
+                      "26% equity / 12.5% white-list bonds", delta_color="off")
+            t2.metric("Fees", _money(res_full.total_fees, ccy),
+                      f"{res_full.num_trades} trades", delta_color="off")
+            t3.metric("Max drift after",
+                      f"{max(after_full.max_asset_drift, after_full.max_bucket_drift) * 100:.1f}%",
+                      f"from {max(drift.max_asset_drift, drift.max_bucket_drift) * 100:.1f}%",
+                      delta_color="off")
+            st.dataframe(res_full.table, hide_index=True, use_container_width=True)
+            st.caption(
+                "💡 **Trade-off**: you pay the tax above *now* to remove the "
+                "remaining drift. If the tax is large relative to the drift "
+                "removed, prefer waiting and steering new cash instead. "
+                "Broker note: **Trade Republic** withholds the tax at source "
+                "(sostituto d'imposta); on **IBKR** you settle it yourself in "
+                "the tax return (regime dichiarativo). Losses realised on "
+                "**ETFs** cannot offset other gains under Italian rules "
+                "(redditi di capitale) — losses on single stocks/ETCs can.")
+
+    _render_assumptions(params, result, threshold_pct)
 
 
 # --------------------------------------------------------------------------- #
@@ -1920,6 +2179,14 @@ def render_results(result, current, noise, deployment, data, params,
     else:
         params["asset_tolerances"] = None
 
+    # The research report is deliberately DEMOTED below the Action Plan: it
+    # explains and stress-tests the decision, it does not drive it.
+    st.markdown("---")
+    st.subheader("📚 Research report — the analysis behind the plan")
+    st.caption("Markowitz diagnostics, risk structure, backtests and projections. "
+               "Advisory context for the Action Plan above — the plan itself always "
+               "targets *your* bucket allocation.")
+
     # Clean narrative order: what you hold → optimise → risk structure →
     # past behaviour → future projection → savings history → act.
     (tab_comp, tab_frontier, tab_risk, tab_bt,
@@ -1974,11 +2241,13 @@ def main() -> None:
     _init_state()
     store = _get_store()
 
-    st.title("📈 Portfolio Optimizer — Institutional MPT")
-    st.markdown("A spacious **Financial Research Report** in seven screens: "
-                "composition & P&L · efficient frontier · risk clustering · historical "
-                "backtest · Monte-Carlo projection · PAC ledger · executive action "
-                "blueprint. *Open the sidebar (top-left ›) to adjust parameters.*")
+    st.title("📈 Portfolio Optimizer — from plan to orders")
+    st.markdown("Enter your holdings and your **bucket targets**, add the cash "
+                "you want to invest, and get a concrete **Action Plan in whole "
+                "shares and euros** — buys first, sells only on request with the "
+                "tax bill shown. The full research report (frontier, risk, "
+                "backtests) follows below the plan. *Sidebar (top-left ›) for "
+                "parameters. Decision-support aid, not financial advice.*")
 
     params = render_sidebar()
 
@@ -1987,11 +2256,12 @@ def main() -> None:
         st.warning(f"❄️ Displaying Frozen Portfolio Snapshot from **{frozen_ts}**. "
                    "(TWS Offline Mode) — backtester & Monte-Carlo remain fully operational.")
     edited, watchlist = render_data_input()
+    _render_target_editor()
 
     # Auto-commit holdings + settings to the local DB on every interaction.
     _persist_state(store, edited)
 
-    run = st.button("🔍 Optimize portfolio", type="primary", use_container_width=True)
+    run = st.button("🔍 Build my Action Plan", type="primary", use_container_width=True)
     auto_run = st.session_state.auto_run
     st.session_state.auto_run = False
     if run or auto_run:
@@ -1999,10 +2269,11 @@ def main() -> None:
     # Results stay sticky once computed, so in-panel buttons (record tranche,
     # report, freeze) re-render without forcing another Optimize click.
     if not st.session_state.get("has_run"):
-        st.info("Edit or import your holdings, set parameters, then click **Optimize portfolio**.")
+        st.info("Edit or import your holdings, set your bucket targets and the "
+                "cash to invest, then click **Build my Action Plan**.")
         return
 
-    shares, purchase_prices, asset_types = _parse_holdings(edited)
+    shares, purchase_prices, asset_types, buckets = _parse_holdings(edited)
     if len(shares) < 1:
         st.error("Please enter at least one ticker.")
         return
@@ -2054,7 +2325,14 @@ def main() -> None:
     if data["failed_tickers"]:
         st.warning("No data for: " + ", ".join(data["failed_tickers"]) + ". Excluded.")
     if len(base_pool) < 2:
-        st.error("Fewer than two assets (holdings + anchor) returned usable data.")
+        st.error(
+            "**Portfolio statistics need at least two assets with price data** — "
+            "correlations and the risk/return trade-off are only defined between "
+            "assets. You currently have "
+            f"**{len(base_pool)}** usable ticker(s). Fix: add a second holding "
+            "(even 0 shares works as watch-only), check the ticker spelling "
+            "(Yahoo format, e.g. `VWCE.DE`, `EIMI.MI`), or switch the price "
+            "source if the data feed is blocked.")
         return
 
     st.subheader("2 · Data")
@@ -2100,6 +2378,10 @@ def main() -> None:
         base_value = current.total_value if current is not None else 0.0
         deployment = deployment_plan(base_value, params["capital"],
                                      params["deployment_strategy"], params["tranches"])
+
+    # THE deliverable: the answer-first action plan toward the user's buckets.
+    _render_action_plan(result, current, deployment, data, params,
+                        asset_types, buckets)
 
     watchlist_result = None
     if watchlist_valid:

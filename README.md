@@ -1,14 +1,75 @@
-# 📈 Portfolio Optimizer — Modern Portfolio Theory (Markowitz)
+# 📈 Portfolio Optimizer — from plan to orders
 
-An interactive web app that builds the **efficient frontier**, finds the
-**Minimum-Variance** and **Maximum-Sharpe (tangency)** portfolios, and shows how
-your *current* allocation compares — all on an interactive Plotly chart, with
-concrete reallocation suggestions underneath.
+A practical rebalancing tool for a **buy-and-hold private investor** (built for
+the Italian tax regime, EUR base, Trade Republic + IBKR Europe). You declare
+your **own target allocation as buckets** (Core / Thematic / Satellite Quality /
+Speculative / Gold), enter your holdings and the cash you want to invest, and
+get an **Action Plan in whole shares and euros** — *"BUY 3 × VWCE.DE ≈ €390"* —
+never abstract percentages. Markowitz analytics (efficient frontier, risk
+clustering, backtests, Monte-Carlo) are attached as a **research report that
+explains the plan but does not drive it**.
 
 Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 [`PyPortfolioOpt`](https://github.com/robertmartin8/PyPortfolioOpt)
 (optimisation), [`Plotly`](https://plotly.com/python/) (charts) and
 [`Streamlit`](https://streamlit.io/) (UI).
+
+---
+
+## How to use it (the real workflow)
+
+1. **Enter your holdings** in the grid: Yahoo ticker (`VWCE.DE`, `EIMI.MI`,
+   `ABT`…), shares, average purchase price (drives P/L and the tax estimate),
+   asset type (sets 26% vs 12.5% tax) and — crucially — the **Bucket** each
+   position belongs to. Or drag-and-drop an IBKR position CSV.
+2. **Set your plan** in *🎯 My target allocation*: percent per bucket
+   (default: Core 40 · Thematic 12 · Satellite 20 · Speculative 8 · Gold 20).
+   Inside a bucket the target splits equally across its holdings.
+3. **Enter the new cash** you want to invest (sidebar → *Additional capital*)
+   and click **Build my Action Plan**.
+4. **Read the verdict first**:
+   - **✅ NO ACTION NEEDED** — every drift is under your materiality threshold
+     (default 3%); trading would only burn fees and tax.
+   - **🛒 Deploy €X** — a whole-share, buy-only order list (ticker, shares,
+     euro cost, custodian) that pushes you back toward your plan **without
+     selling anything** — so no capital-gains tax.
+   - **🔁 Full rebalance** — only on explicit request, always shown *with* the
+     estimated 26%/12.5% tax bill so you can weigh tax paid vs drift removed.
+5. Every number carries a plain-language explanation, and the *Assumptions*
+   panel lists every model input (risk-free rate, lookback, estimator…) with a
+   one-line "why".
+
+## How to interpret the outputs
+
+- **Max drift** — the largest gap between a current and target weight, at
+  asset *and* bucket level. It is the single number the verdict hangs on.
+- **Buy-only plan** — allocates your cash to the most-underweight positions
+  (whole shares, knapsack-rounded so residual cash is minimal). Selling is
+  *never* proposed here.
+- **Tax estimate** — Italian capital gains: 26% on equities/ETFs/ETCs, 12.5%
+  on white-list government bonds, charged only on the *gain* portion of sells.
+  Trade Republic withholds at source (sostituto d'imposta); on IBKR you settle
+  through your tax return (regime dichiarativo).
+- **Research report** — the Markowitz frontier, Sharpe ratios, risk clustering
+  and backtests are *advisory context*: historical estimates are noisy, so the
+  optimiser output is deliberately not used as your trading target.
+
+## Known limitations (read before trusting a number)
+
+- **Expected returns are historical means** — the least reliable estimator in
+  finance. They colour the research tabs; they do not drive your plan.
+- **Equal split inside buckets** — a deliberate simplification; adjust bucket
+  membership to change effective per-asset targets.
+- **One average cost per ticker** (≈ Italian *costo medio ponderato*): no
+  per-lot accounting, no acquisition dates.
+- **Tax simplifications**: the 26%/12.5% estimate ignores the minusvalenze
+  compensation rules — in Italy **ETF losses cannot offset other gains**
+  (redditi di capitale) while single-stock/ETC losses can (redditi diversi) —
+  and assumes the white-list rate from the "Bond" asset type.
+- **Short histories truncate the common window** — the app now warns loudly
+  which ticker cut the window and when estimates rest on <1 year of data.
+- **Decision-support aid, not financial advice.** Estimates come from past
+  data and can be substantially wrong.
 
 ---
 
@@ -64,6 +125,11 @@ Built with [`yfinance`](https://github.com/ranaroussi/yfinance) (price data),
 | **Cash-inflow drift efficiency monitor** | `optimizer.required_capital_to_align` |
 | **Executive HTML report export** | `portfolio.build_executive_report_html` |
 | **Live snapshot freeze + offline recovery** | `PortfolioStore.save_frozen_snapshot` |
+| **Bucket target allocation** (your plan as the rebalancing target) | `portfolio.target_weights_from_buckets` |
+| **Drift report + materiality verdict** ("no action needed") | `portfolio.compute_drift` |
+| **Answer-first Action Plan** (whole shares, EUR, buy-only default) | `app._render_action_plan` |
+| **Tax-aware full rebalance on request** (26%/12.5% bill + trade-off) | `app.py` + `portfolio.reallocation_plan` |
+| **Short-history truncation warnings** | `data_loader.build_price_data` |
 | **Black-Litterman market-view overrides** (per-ticker excess + confidence) | `optimizer.black_litterman_posterior_returns` |
 | **Regime-shift correlation stress** (×1.4 convergence, vol-preserving) | `optimizer.stress_correlation_convergence` |
 | **Dynamic adaptive rebalancing bands** (`base_factor × σᵢ`) | `portfolio.adaptive_tolerance_bands` |
@@ -76,11 +142,12 @@ Hover any point to see its return, volatility, Sharpe ratio and weights.
 
 ### Advanced controls (sidebar)
 
-- **Fetch Live Risk-Free Rate (^IRX)** — toggled on by default; pulls the US
-  3-Month Treasury Bill yield from Yahoo Finance and divides by 100. Toggle off
-  (or on fetch failure) to enter Rf manually.
-- **Market Benchmark Ticker** — defaults to `SPY`; plotted as a gold marker and
-  used as the market proxy for Black-Litterman priors.
+- **Risk-free rate** — defaults to a manual **2.5% EUR short-rate proxy**
+  (consistent with a EUR portfolio). The live ^IRX fetch (US 3-month T-Bill, a
+  *USD* rate) remains available behind a toggle.
+- **Market Benchmark Ticker** — defaults to `VWCE.DE` (FTSE All-World UCITS);
+  plotted as a gold marker and used as the market proxy for Black-Litterman
+  priors.
 - **Expected-returns model** — *Historical mean* or *Black-Litterman
   (market-implied)*. BL derives the implied risk-aversion from the benchmark and
   returns the equilibrium prior `Π = δ·Σ·w_mkt + R_f` (equal-weight market
@@ -102,10 +169,12 @@ runs the optimisation. The table is fully editable — click **+** to add assets
 held on other brokers (Trade Republic, Degiro, …). Each row has:
 
 - **Ticker** — any Yahoo Finance symbol, stocks **and** bonds/bond ETFs
-  (`AAPL`, `VWCE.DE`, `AGGH.MI`, `EMBE.MI`).
+  (`VWCE.DE`, `EIMI.MI`, `ABT`, `AGGH.MI`).
 - **Shares** — units held (`0` = include in the optimisation as watch-only).
 - **Purchase Price** — optional average buy price; drives the per-asset and
-  total **unrealised P/L**.
+  total **unrealised P/L** and the capital-gains tax estimate.
+- **Bucket** — which slice of *your* plan the position belongs to; the Action
+  Plan rebalances toward the bucket targets.
 
 ### Core global anchor (VWCE.DE)
 
