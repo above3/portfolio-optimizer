@@ -36,6 +36,7 @@ _SECTOR_LABELS: dict[str, str] = {
     "market": "Diversified ETF",
     "bond": "Fixed Income",
     "gold": "Commodities",
+    "industrial": "Industrials",
 }
 
 # Native currency inferred from the Yahoo exchange suffix (offline heuristic).
@@ -111,6 +112,17 @@ _KNOWN_PROFILES: dict[str, tuple[float, float, str]] = {
     "VWCE.DE": (0.09, 0.15, "market"),
     "IWDA.AS": (0.09, 0.15, "market"),
     "ACWI": (0.09, 0.16, "market"),
+    # The Italian demo portfolio: UCITS ETFs, quality names, gold ETC, spec.
+    "EIMI.MI": (0.07, 0.18, "market"),      # iShares Core EM IMI (Borsa Italiana)
+    "DFND.MI": (0.14, 0.24, "industrial"),  # VanEck Defense UCITS
+    "XDWH.MI": (0.10, 0.14, "health"),      # Xtrackers MSCI World Health Care
+    "UNA.AS": (0.07, 0.16, "consumer"),     # Unilever (Amsterdam, EUR)
+    "ABT": (0.10, 0.18, "health"),          # Abbott
+    "SGLD.MI": (0.06, 0.14, "gold"),        # Invesco Physical Gold ETC
+    "NKE": (0.08, 0.26, "consumer"),        # Nike (concentrated spec position)
+    "SOFI": (0.15, 0.55, "financial"),      # SoFi (high-vol speculative)
+    "MC.PA": (0.11, 0.27, "consumer"),      # LVMH (Paris, EUR)
+    "NVO": (0.12, 0.24, "health"),          # Novo Nordisk ADR
     # Bonds / bond ETFs — low return, low volatility, weakly correlated.
     "AGGH.MI": (0.030, 0.05, "bond"),
     "EMBE.MI": (0.045, 0.09, "bond"),

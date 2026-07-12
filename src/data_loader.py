@@ -342,12 +342,41 @@ def build_price_data(
     valid = [t for t in requested if t in close.columns]
     failed = [t for t in requested if t not in valid]
 
+    # The joint panel is truncated to the SHORTEST series (statistics need a
+    # common window). That silent truncation is dangerous with recently listed
+    # UCITS ETFs — one young ticker can throw away years of everyone else's
+    # history — so detect and *loudly* report which tickers cut the window.
+    notes: list[str] = []
+    if valid:
+        first_valid = {t: close[t].first_valid_index() for t in valid}
+        known = {t: ts for t, ts in first_valid.items() if ts is not None}
+        if len(known) > 1:
+            starts = pd.Series(known)
+            joint_start, median_start = starts.max(), starts.median()
+            truncators = [t for t, ts in known.items()
+                          if ts == joint_start and (ts - median_start).days > 180]
+            if truncators and (joint_start - median_start).days > 180:
+                lost_days = int((joint_start - median_start).days)
+                notes.append(
+                    "⚠️ Short history: " + ", ".join(sorted(truncators))
+                    + f" only start on {joint_start.date()}, cutting roughly "
+                    f"{lost_days // 30} months off the shared estimation window "
+                    "for every asset. Statistics are computed on the shorter "
+                    "common window — consider a longer-listed share class or "
+                    "interpret the estimates with extra caution.")
+
     prices = close[valid].dropna(how="any")
     if prices.empty or prices.shape[0] < 2:
         raise PriceDataError(
             "Not enough overlapping price history to compute statistics. "
             "Try a longer lookback or different tickers."
         )
+    if prices.shape[0] < TRADING_DAYS_PER_YEAR:
+        notes.append(
+            f"⚠️ Only {prices.shape[0]} overlapping trading days "
+            f"(~{prices.shape[0] / 21:.0f} months) are available — expected "
+            "returns and covariances estimated on under a year of data are "
+            "statistically weak. Treat the optimiser output as indicative only.")
 
     benchmark_prices = None
     if bench and bench in close.columns:
@@ -356,7 +385,6 @@ def build_price_data(
             benchmark_prices = None
 
     # ---- Metadata (currency + sector) ----
-    notes: list[str] = []
     meta_symbols = list(valid) + ([bench] if benchmark_prices is not None else [])
     if currencies is None or sectors is None:
         metadata = fetch_asset_metadata(meta_symbols, default_currency=base_currency or "USD")

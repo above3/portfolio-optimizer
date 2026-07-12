@@ -27,6 +27,8 @@ import pandas as pd
 
 from .config import (
     DEFAULT_ASSET_TYPE,
+    DEFAULT_BUCKET,
+    DEFAULT_DRIFT_THRESHOLD_PCT,
     TAX_RATE_BOND,
     TAX_RATE_EQUITY,
     UNKNOWN_SECTOR,
@@ -365,6 +367,137 @@ def adaptive_tolerance_bands(
     """
     return {ticker: max(0.0, float(base_factor) * float(sigma))
             for ticker, sigma in (volatilities or {}).items()}
+
+
+# --------------------------------------------------------------------------- #
+# Bucket-based target allocation (the user's plan is the target, not Markowitz)
+# --------------------------------------------------------------------------- #
+def target_weights_from_buckets(
+    bucket_targets_pct: dict[str, float],
+    assignments: dict[str, str],
+    tickers: list[str] | None = None,
+) -> tuple[dict[str, float], list[str]]:
+    """Expand bucket-level targets into per-asset target weights.
+
+    Why buckets: the investor's plan is expressed as "Core 40%, Thematic 12%…",
+    not as per-ticker percentages — so the *plan* is the source of truth and the
+    optimiser output is advisory only.
+
+    Rules (each one is a deliberate, documented simplification):
+    - Within a bucket the target splits **equally** across its assets. A cap-
+      weighted or user-set split can be layered later; equal split keeps the
+      plan legible and matches "I hold 2 core ETFs at ~20% each".
+    - Buckets with **no assigned holdings** are dropped and the remaining
+      targets renormalised, with an explanatory note — a target you cannot
+      express with your current instruments is not actionable.
+    - Percentages that do not sum to 100 are renormalised (note added) instead
+      of raising: the tool must never crash on a slightly-off plan.
+
+    Returns ``({ticker: weight}, notes)`` with weights summing to 1.0.
+    """
+    notes: list[str] = []
+    tickers = [t for t in (tickers or list(assignments)) if t]
+
+    # Group the universe by bucket.
+    members: dict[str, list[str]] = {}
+    for t in tickers:
+        bucket = str(assignments.get(t) or DEFAULT_BUCKET)
+        members.setdefault(bucket, []).append(t)
+        if t not in assignments:
+            notes.append(f"'{t}' has no bucket — assigned to '{DEFAULT_BUCKET}'.")
+
+    # Keep only buckets that are actually populated.
+    populated = {b: float(bucket_targets_pct.get(b, 0.0))
+                 for b in members if float(bucket_targets_pct.get(b, 0.0)) > 0}
+    empty = [b for b, pct in (bucket_targets_pct or {}).items()
+             if float(pct) > 0 and b not in members]
+    if empty:
+        notes.append(
+            "No holdings in bucket(s) " + ", ".join(f"'{b}'" for b in sorted(empty))
+            + " — their target was redistributed proportionally.")
+    unbudgeted = [b for b in members if b not in populated]
+    if unbudgeted:
+        notes.append(
+            "Bucket(s) " + ", ".join(f"'{b}'" for b in sorted(unbudgeted))
+            + " have a 0% target — their holdings get a 0% target weight.")
+
+    total = sum(populated.values())
+    if not populated or total <= 0:
+        # Degenerate plan: fall back to equal weight so the tool stays usable.
+        eq = 1.0 / len(tickers) if tickers else 0.0
+        notes.append("Bucket targets were empty/zero — fell back to equal weight.")
+        return {t: eq for t in tickers}, notes
+    if abs(total - 100.0) > 0.5:
+        notes.append(f"Bucket targets sum to {total:.1f}% — renormalised to 100%.")
+
+    weights: dict[str, float] = {t: 0.0 for t in tickers}
+    for bucket, pct in populated.items():
+        share = (pct / total) / len(members[bucket])   # equal split inside bucket
+        for t in members[bucket]:
+            weights[t] = share
+    return weights, notes
+
+
+@dataclass
+class DriftReport:
+    """Deviation of the current allocation from the bucket-plan target."""
+
+    asset_rows: pd.DataFrame     # Ticker | Bucket | Current % | Target % | Drift %
+    bucket_rows: pd.DataFrame    # Bucket | Current % | Target % | Drift %
+    max_asset_drift: float       # max |drift| across assets (decimal)
+    max_bucket_drift: float      # max |drift| across buckets (decimal)
+    threshold: float             # materiality threshold (decimal)
+    action_needed: bool          # True when either max drift breaches it
+    notes: list[str]
+
+
+def compute_drift(
+    current_weights: dict[str, float],
+    target_weights: dict[str, float],
+    assignments: dict[str, str],
+    threshold: float = DEFAULT_DRIFT_THRESHOLD_PCT / 100.0,
+    notes: list[str] | None = None,
+) -> DriftReport:
+    """Compare current vs target weights at asset AND bucket level.
+
+    The materiality verdict uses both levels: a bucket can be on target while a
+    single name inside it (e.g. a concentrated speculative position) is far off,
+    and vice versa. Below ``threshold`` on both -> "no action needed", because
+    micro-rebalancing burns fees and taxes for no economic benefit.
+    """
+    tickers = sorted(set(current_weights) | set(target_weights))
+    asset_rows = []
+    bucket_cur: dict[str, float] = {}
+    bucket_tgt: dict[str, float] = {}
+    for t in tickers:
+        cur = float(current_weights.get(t, 0.0))
+        tgt = float(target_weights.get(t, 0.0))
+        bucket = str(assignments.get(t) or DEFAULT_BUCKET)
+        bucket_cur[bucket] = bucket_cur.get(bucket, 0.0) + cur
+        bucket_tgt[bucket] = bucket_tgt.get(bucket, 0.0) + tgt
+        asset_rows.append({
+            "Ticker": t, "Bucket": bucket,
+            "Current %": round(cur * 100, 2), "Target %": round(tgt * 100, 2),
+            "Drift %": round((cur - tgt) * 100, 2),
+        })
+    bucket_rows = [{
+        "Bucket": b,
+        "Current %": round(bucket_cur.get(b, 0.0) * 100, 2),
+        "Target %": round(bucket_tgt.get(b, 0.0) * 100, 2),
+        "Drift %": round((bucket_cur.get(b, 0.0) - bucket_tgt.get(b, 0.0)) * 100, 2),
+    } for b in sorted(set(bucket_cur) | set(bucket_tgt))]
+
+    max_asset = max((abs(r["Drift %"]) for r in asset_rows), default=0.0) / 100.0
+    max_bucket = max((abs(r["Drift %"]) for r in bucket_rows), default=0.0) / 100.0
+    return DriftReport(
+        asset_rows=pd.DataFrame(asset_rows),
+        bucket_rows=pd.DataFrame(bucket_rows),
+        max_asset_drift=max_asset,
+        max_bucket_drift=max_bucket,
+        threshold=float(threshold),
+        action_needed=bool(max(max_asset, max_bucket) >= float(threshold)),
+        notes=list(notes or []),
+    )
 
 
 def _knapsack_topup(
@@ -863,7 +996,8 @@ _DEFAULT_DB_PATH = Path(
 )
 
 # Columns the holdings table is normalised to on load.
-HOLDINGS_COLUMNS: tuple[str, ...] = ("Ticker", "Shares", "Purchase Price", "Asset Type")
+HOLDINGS_COLUMNS: tuple[str, ...] = (
+    "Ticker", "Shares", "Purchase Price", "Asset Type", "Bucket")
 
 
 class PortfolioStore:
@@ -1067,6 +1201,9 @@ def normalise_holdings_df(df: pd.DataFrame) -> pd.DataFrame:
         out["Asset Type"] = DEFAULT_ASSET_TYPE
     if "Purchase Price" not in out.columns:
         out["Purchase Price"] = None
+    if "Bucket" not in out.columns:
+        out["Bucket"] = DEFAULT_BUCKET
+    out["Bucket"] = out["Bucket"].fillna(DEFAULT_BUCKET).replace("", DEFAULT_BUCKET)
     for col in ("Ticker", "Shares"):
         if col not in out.columns:
             out[col] = "" if col == "Ticker" else 0.0
@@ -1113,6 +1250,7 @@ def positions_to_holdings_df(positions) -> pd.DataFrame:
             "Shares": shares,
             "Purchase Price": round(avg, 4) if avg else None,
             "Asset Type": atype or guess_asset_type(sym),
+            "Bucket": DEFAULT_BUCKET,
         })
     return normalise_holdings_df(pd.DataFrame(rows, columns=list(HOLDINGS_COLUMNS)))
 

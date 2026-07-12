@@ -620,10 +620,12 @@ def test_store_recovers_from_corrupt_db(tmp_path):
 
 
 def test_normalise_holdings_df_fills_schema():
-    df = pd.DataFrame({"Ticker": ["AAPL"], "Shares": [3]})  # missing 2 columns
+    df = pd.DataFrame({"Ticker": ["AAPL"], "Shares": [3]})  # missing 3 columns
     out = normalise_holdings_df(df)
-    assert list(out.columns) == ["Ticker", "Shares", "Purchase Price", "Asset Type"]
+    assert list(out.columns) == ["Ticker", "Shares", "Purchase Price",
+                                 "Asset Type", "Bucket"]
     assert out.loc[0, "Asset Type"] == "Stock/ETF"
+    assert out.loc[0, "Bucket"] == "Core"  # legacy rows default to the Core bucket
 
 
 # --------------------------------------------------------------------------- #
@@ -1081,3 +1083,77 @@ def test_gbm_goal_required_monthly_reaches_target_deterministically():
     drift = (0.06 - 0.5 * 0.18 ** 2) * (1.0 / spm)
     terminal = _median_terminal_wealth(5_000, drift, steps, goal.required_monthly)
     assert terminal >= 500_000 - 1.0  # median path lands on (or just above) target
+
+
+# --------------------------------------------------------------------------- #
+# Bucket-based target allocation (the user's plan as the rebalancing target)
+# --------------------------------------------------------------------------- #
+def test_bucket_targets_equal_split_and_sum_to_one():
+    from src.portfolio import target_weights_from_buckets
+    assign = {"VWCE": "Core", "EIMI": "Core", "DFND": "Thematic", "NKE": "Speculative"}
+    weights, notes = target_weights_from_buckets(
+        {"Core": 40, "Thematic": 12, "Speculative": 8}, assign, list(assign))
+    assert sum(weights.values()) == pytest.approx(1.0)
+    # Core 40/60 of the populated total, split equally across two ETFs.
+    assert weights["VWCE"] == pytest.approx(weights["EIMI"])
+    assert weights["VWCE"] == pytest.approx(40 / 60 / 2)
+    assert weights["NKE"] == pytest.approx(8 / 60)
+    # Targets covering only 60% -> transparently renormalised with a note.
+    assert any("renormalised" in n for n in notes)
+
+
+def test_bucket_targets_drop_empty_and_renormalise():
+    from src.portfolio import target_weights_from_buckets
+    weights, notes = target_weights_from_buckets(
+        {"Core": 50, "Thematic": 30, "Gold/Defensive": 20},
+        {"A": "Core", "B": "Thematic"}, ["A", "B"])
+    assert weights == {"A": pytest.approx(50 / 80), "B": pytest.approx(30 / 80)}
+    assert any("Gold/Defensive" in n for n in notes)
+
+
+def test_bucket_targets_degenerate_plan_falls_back_to_equal_weight():
+    from src.portfolio import target_weights_from_buckets
+    weights, notes = target_weights_from_buckets({}, {}, ["A", "B", "C", "D"])
+    assert all(w == pytest.approx(0.25) for w in weights.values())
+    assert any("equal weight" in n for n in notes)
+
+
+def test_compute_drift_verdicts():
+    from src.portfolio import compute_drift, target_weights_from_buckets
+    assign = {"VWCE": "Core", "NKE": "Speculative"}
+    target, _ = target_weights_from_buckets({"Core": 80, "Speculative": 20},
+                                            assign, list(assign))
+    # Exactly on target -> no action.
+    rep = compute_drift(dict(target), target, assign, threshold=0.03)
+    assert not rep.action_needed and rep.max_asset_drift == pytest.approx(0.0)
+    # NKE ballooned to 35% (spec bucket breach) -> action needed.
+    rep2 = compute_drift({"VWCE": 0.65, "NKE": 0.35}, target, assign, threshold=0.03)
+    assert rep2.action_needed
+    assert rep2.max_bucket_drift == pytest.approx(0.15)
+    spec = rep2.bucket_rows.set_index("Bucket").loc["Speculative"]
+    assert spec["Drift %"] == pytest.approx(15.0)
+
+
+def test_new_cash_plan_reduces_drift_without_sells():
+    """End-to-end P0 flow: buy-only whole-share plan moves toward the buckets."""
+    from src.portfolio import compute_drift, reallocation_plan, target_weights_from_buckets
+    assign = {"VWCE": "Core", "SGLD": "Gold/Defensive", "NKE": "Speculative"}
+    target, _ = target_weights_from_buckets(
+        {"Core": 60, "Gold/Defensive": 30, "Speculative": 10}, assign, list(assign))
+    current_values = {"VWCE": 4_000.0, "SGLD": 1_000.0, "NKE": 3_000.0}  # NKE heavy
+    latest = pd.Series({"VWCE": 100.0, "SGLD": 50.0, "NKE": 75.0})
+    cash = 4_000.0
+    total = sum(current_values.values()) + cash
+    res = reallocation_plan(current_values, target, total, latest,
+                            buy_only=True, allow_fractional=False, tolerance=0.0)
+    actions = dict(zip(res.table["Ticker"], res.table["Action"]))
+    assert "SELL" not in actions.values()  # never sells in new-cash mode
+    before = compute_drift({t: v / (total - cash) for t, v in current_values.items()},
+                           target, assign).max_asset_drift
+    achieved = res.achieved_weights
+    after = compute_drift(achieved, target, assign).max_asset_drift
+    assert after < before  # the cash measurably closes the gap
+    # Whole shares only.
+    for shares in res.table["Shares to trade"]:
+        if shares is not None and shares == shares:
+            assert float(shares) == int(float(shares))
